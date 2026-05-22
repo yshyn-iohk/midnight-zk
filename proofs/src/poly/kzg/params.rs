@@ -300,6 +300,99 @@ where
             s_g2,
         })
     }
+
+    /// Reads params from a seekable buffer, **skipping the on-disk
+    /// `g_lagrange` block entirely**. The Lagrange basis is left
+    /// uninitialised; the first `commit_lagrange` (or
+    /// `g_lagrange_slice` consumer) will recompute it via inverse-NTT
+    /// of `g`.
+    ///
+    /// Memory profile vs. [`read_custom`]:
+    ///
+    /// - `read_custom` allocates two `Vec<E::G1>` of size 2^k during
+    ///   parsing. Peak resident is 2× the SRS during load.
+    /// - `read_custom_lazy` allocates only the `g` vector. Peak resident
+    ///   stays at 1× the SRS during load.
+    /// - The `Vec::drop` + recompute approach has the same final
+    ///   footprint as `read_custom_lazy` *but* a 2× peak during load,
+    ///   plus the allocator pool tends to keep the freed pages. Doing
+    ///   the skip at read time avoids both costs.
+    ///
+    /// At k=20 (BLS12-381, 96 B per stored G1 element) this saves
+    /// ~96 MiB peak; at k=22 it saves ~384 MiB. Critical on mobile
+    /// where the OS kills the process well before peak heap maps to
+    /// "total RAM".
+    ///
+    /// The block size is derived from `g`'s on-disk footprint — no
+    /// per-element-size constants need to be hard-coded — so the
+    /// method works for all three `SerdeFormat` variants.
+    ///
+    /// `R: Read + Seek`. `MidnightDataProvider`'s `BufReader<File>`
+    /// satisfies both; in-memory `&[u8]` does via `io::Cursor<&[u8]>`.
+    pub fn read_custom_lazy<R: io::Read + io::Seek>(
+        reader: &mut R,
+        format: SerdeFormat,
+    ) -> io::Result<Self>
+    where
+        E::G1: Curve + ProcessedSerdeObject,
+        E::G2: Curve + ProcessedSerdeObject,
+    {
+        let mut k = [0u8; 4];
+        reader.read_exact(&mut k[..])?;
+        let k = u32::from_le_bytes(k);
+        let n = 1 << k;
+
+        // Position before reading the `g` block. Used to compute the
+        // matching block size for the seek-past-g_lagrange step below.
+        let pos_before_g = reader.stream_position()?;
+
+        let g: Vec<E::G1> = match format {
+            SerdeFormat::Processed => {
+                use group::GroupEncoding;
+                let mut points_compressed =
+                    vec![<<E as Engine>::G1 as GroupEncoding>::Repr::default(); n];
+                for points_compressed in points_compressed.iter_mut() {
+                    reader.read_exact((*points_compressed).as_mut())?;
+                }
+                let mut points = vec![Option::<E::G1>::None; n];
+                parallelize(&mut points, |points, chunks| {
+                    for (i, point) in points.iter_mut().enumerate() {
+                        *point = Option::from(E::G1::from_bytes(&points_compressed[chunks + i]));
+                    }
+                });
+                points
+                    .into_iter()
+                    .map(|point| point.ok_or_else(|| io::Error::other("invalid point encoding")))
+                    .collect::<Result<_, _>>()?
+            }
+            SerdeFormat::RawBytes => (0..n)
+                .map(|_| <E::G1 as ProcessedSerdeObject>::read(reader, format))
+                .collect::<Result<Vec<_>, _>>()?,
+            SerdeFormat::RawBytesUnchecked => (0..n)
+                .map(|_| <E::G1 as ProcessedSerdeObject>::read(reader, format).unwrap())
+                .collect::<Vec<_>>(),
+        };
+
+        // Seek past `g_lagrange` (same shape and size as the `g`
+        // block we just consumed). No allocation, no parse, no
+        // page-cache touch beyond what the disk subsystem reads
+        // anyway for the file metadata.
+        let pos_after_g = reader.stream_position()?;
+        let block_size = pos_after_g - pos_before_g;
+        reader.seek(io::SeekFrom::Current(block_size as i64))?;
+
+        let g2 = E::G2::read(reader, format)?;
+        let s_g2 = E::G2::read(reader, format)?;
+
+        Ok(Self {
+            g,
+            // Empty lock — `g_lagrange_slice()` will populate via
+            // inverse-NTT of `g` on first access.
+            g_lagrange: OnceLock::new(),
+            g2,
+            s_g2,
+        })
+    }
 }
 
 // TODO: see the issue at https://github.com/appliedzkp/halo2/issues/45
@@ -410,6 +503,41 @@ mod test {
         assert_eq!(params0.g_lagrange_slice(), params1.g_lagrange_slice());
         assert_eq!(params0.g2, params1.g2);
         assert_eq!(params0.s_g2, params1.s_g2);
+    }
+
+    /// Verifies that `read_custom_lazy` reads back the same `g`, `g2`,
+    /// `s_g2` as `read_custom`, and that the deferred Lagrange basis
+    /// — computed via FFT on first access — equals the eagerly-read
+    /// basis. Confirms both that the seek-past-g_lagrange step lands
+    /// at the right offset and that the lazy recompute is correct.
+    #[test]
+    fn test_read_custom_lazy_matches_eager() {
+        const K: u32 = 5;
+
+        use midnight_curves::Bls12;
+
+        let params_eager: ParamsKZG<Bls12> = ParamsKZG::unsafe_setup(K, OsRng);
+        let mut buf = Vec::new();
+        ParamsKZG::write_custom(&params_eager, &mut buf, SerdeFormat::RawBytesUnchecked).unwrap();
+
+        let mut cursor = std::io::Cursor::new(&buf[..]);
+        let params_lazy =
+            ParamsKZG::<Bls12>::read_custom_lazy(&mut cursor, SerdeFormat::RawBytesUnchecked)
+                .unwrap();
+
+        // Monomial basis + G2 components match byte-for-byte.
+        assert_eq!(params_eager.g, params_lazy.g);
+        assert_eq!(params_eager.g2, params_lazy.g2);
+        assert_eq!(params_eager.s_g2, params_lazy.s_g2);
+
+        // Cursor must be at end-of-buffer — seek landed correctly.
+        assert_eq!(cursor.position() as usize, buf.len());
+
+        // Lagrange basis from FFT recompute equals the eager parse.
+        assert_eq!(
+            params_eager.g_lagrange_slice(),
+            params_lazy.g_lagrange_slice()
+        );
     }
 
     /// Verifies that the lazy Lagrange basis matches an eager
