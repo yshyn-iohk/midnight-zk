@@ -300,6 +300,7 @@ where
     CS: PolynomialCommitmentScheme<F>,
     ConcreteCircuit: Circuit<F>,
 {
+    crate::plonk::prover::log_phase_pub("keygen_pk.start");
     let mut cs = ConstraintSystem::default();
     #[cfg(feature = "circuit-params")]
     let config = ConcreteCircuit::configure_with_params(&mut cs, circuit.params());
@@ -317,6 +318,7 @@ where
         usable_rows: 0..n - (cs.blinding_factors() + 1),
         _marker: std::marker::PhantomData,
     };
+    crate::plonk::prover::log_phase_pub("keygen_pk.assembly_built");
 
     // Synthesize the circuit to obtain URS
     ConcreteCircuit::FloorPlanner::synthesize(
@@ -325,24 +327,32 @@ where
         config,
         cs.constants.clone(),
     )?;
+    crate::plonk::prover::log_phase_pub("keygen_pk.synthesise.end");
 
     let mut fixed = batch_invert_rational(assembly.fixed);
+    crate::plonk::prover::log_phase_pub("keygen_pk.batch_invert_rational.end");
     let (cs, selector_polys) = cs.directly_convert_selectors_to_fixed(assembly.selectors);
     fixed.extend(selector_polys.into_iter().map(|poly| vk.domain.lagrange_from_vec(poly)));
+    crate::plonk::prover::log_phase_pub("keygen_pk.selectors_to_fixed.end");
 
     let fixed_polys: Vec<_> =
         fixed.par_iter().map(|poly| vk.domain.lagrange_to_coeff(poly.clone())).collect();
+    crate::plonk::prover::log_phase_pub("keygen_pk.fixed_polys.end");
 
     let fixed_cosets = fixed_polys
         .par_iter()
         .map(|poly| vk.domain.coeff_to_extended(poly.clone()))
         .collect();
+    crate::plonk::prover::log_phase_pub("keygen_pk.fixed_cosets.end");
 
     let permutation_pk = assembly.permutation.build_pk::<F>(&vk.domain, &cs.permutation);
+    crate::plonk::prover::log_phase_pub("keygen_pk.permutation_pk.end");
 
     let [l0, l_last, l_active_row] = compute_lagrange_polys(&vk, &cs);
+    crate::plonk::prover::log_phase_pub("keygen_pk.lagrange_polys.end");
     // Compute the optimized evaluation data structure
     let ev = Evaluator::new(&vk.cs);
+    crate::plonk::prover::log_phase_pub("keygen_pk.evaluator.end");
     Ok(ProvingKey {
         vk,
         l0,
