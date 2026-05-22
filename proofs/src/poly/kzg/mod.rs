@@ -92,9 +92,13 @@ where
         scalars.extend(poly.iter());
         let size = scalars.len();
 
-        assert!(params.g_lagrange.len() >= size);
+        // `g_lagrange_slice()` lazy-inits the Lagrange basis if it was
+        // never loaded or was released via `drop_lazy_bases`. The hot
+        // path (already-cached) is a single non-blocking load.
+        let g_lagrange = params.g_lagrange_slice();
+        assert!(g_lagrange.len() >= size);
 
-        msm_specific::<E::G1Affine>(&scalars, &params.g_lagrange[0..size])
+        msm_specific::<E::G1Affine>(&scalars, &g_lagrange[0..size])
     }
 
     fn multi_open<T: Transcript>(
