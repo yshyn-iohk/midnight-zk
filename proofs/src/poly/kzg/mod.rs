@@ -11,6 +11,8 @@ use std::marker::PhantomData;
 
 use midnight_curves::pairing::Engine;
 
+/// Storage backing for SRS bases (owned `Vec` vs mmap view).
+pub(crate) mod bases;
 /// Multiscalar multiplication engines
 pub mod msm;
 /// KZG commitment scheme

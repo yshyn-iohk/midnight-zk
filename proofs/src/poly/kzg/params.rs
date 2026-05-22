@@ -7,6 +7,7 @@ use rand_core::RngCore;
 
 use crate::{
     poly::commitment::Params,
+    poly::kzg::bases::BasesStorage,
     utils::{
         arithmetic::{g_to_lagrange, parallelize},
         helpers::ProcessedSerdeObject,
@@ -32,8 +33,14 @@ use crate::{
 /// the Lagrange block to avoid even paying the load-time cost.
 #[derive(Debug, Clone)]
 pub struct ParamsKZG<E: Engine> {
-    pub(crate) g: Vec<E::G1>,
-    pub(crate) g_lagrange: OnceLock<Vec<E::G1>>,
+    /// SRS monomial basis. Heap-allocated `Vec` in the eager path
+    /// (`unsafe_setup`, `read_custom`); slice view into a memory-
+    /// mapped file when constructed via [`read_mmap_arc`](Self::read_mmap_arc).
+    pub(crate) g: BasesStorage<E::G1>,
+    /// SRS Lagrange basis. Lazy — see crate-level docs.
+    /// `g_to_lagrange` only produces owned Vecs, so any
+    /// lazy-recompute path always lands here as `Owned`.
+    pub(crate) g_lagrange: OnceLock<BasesStorage<E::G1>>,
     pub(crate) g2: E::G2,
     pub(crate) s_g2: E::G2,
 }
@@ -66,12 +73,14 @@ where
     /// than touching the field directly so the lazy-init contract is
     /// honoured uniformly.
     pub fn g_lagrange_slice(&self) -> &[E::G1] {
+        // `&self.g` derefs to `&[E::G1]`; `g_to_lagrange` accepts a
+        // slice. Wrap the produced `Vec` back into `BasesStorage`
+        // so the lock's value type stays uniform.
         self.g_lagrange
             .get_or_init(|| {
                 let k = self.g.len().ilog2();
-                g_to_lagrange(&self.g, k)
+                BasesStorage::owned(g_to_lagrange(&self.g, k))
             })
-            .as_slice()
     }
 
     /// Release the cached Lagrange-basis SRS so the prover footprint
@@ -95,7 +104,10 @@ where
 
         let n = 1 << new_k;
         assert!((n as u64) < (1u64 << self.max_k()));
-        self.g.truncate(n);
+        // For mmap-backed `g` this materialises a fresh owned Vec
+        // (the mapping is read-only). For owned `g` it's a normal
+        // in-place truncate.
+        self.g.truncate_into_owned(n);
         // Cached Lagrange basis is now stale (it was sized for the old
         // `g`). Reset; next consumer recomputes against the truncated
         // monomial basis.
@@ -144,11 +156,11 @@ where
         let s_g2 = g2 * s;
 
         Self {
-            g,
+            g: BasesStorage::owned(g),
             // Eagerly cache the Lagrange basis here — `unsafe_setup`
             // computed it anyway (line above), and skipping the cache
             // would just force recompute on first use with no win.
-            g_lagrange: OnceLock::from(g_lagrange),
+            g_lagrange: OnceLock::from(BasesStorage::owned(g_lagrange)),
             g2,
             s_g2,
         }
@@ -169,9 +181,9 @@ where
     ) -> Self {
         let _ = k; // historically used to drive the FFT; now derived from g.len()
         Self {
-            g,
+            g: BasesStorage::owned(g),
             g_lagrange: match g_lagrange {
-                Some(g_l) => OnceLock::from(g_l),
+                Some(g_l) => OnceLock::from(BasesStorage::owned(g_l)),
                 None => OnceLock::new(),
             },
             g2,
@@ -294,8 +306,8 @@ where
         // doesn't redundantly recompute. Callers who want to release
         // the basis between proofs invoke `drop_lazy_bases`.
         Ok(Self {
-            g,
-            g_lagrange: OnceLock::from(g_lagrange),
+            g: BasesStorage::owned(g),
+            g_lagrange: OnceLock::from(BasesStorage::owned(g_lagrange)),
             g2,
             s_g2,
         })
@@ -385,13 +397,240 @@ where
         let s_g2 = E::G2::read(reader, format)?;
 
         Ok(Self {
-            g,
+            g: BasesStorage::owned(g),
             // Empty lock — `g_lagrange_slice()` will populate via
             // inverse-NTT of `g` on first access.
             g_lagrange: OnceLock::new(),
             g2,
             s_g2,
         })
+    }
+
+    /// Reads params from a memory-mapped companion file produced by
+    /// [`write_mmap_companion`](Self::write_mmap_companion).
+    ///
+    /// Constructs `ParamsKZG` with `g` and (if present) `g_lagrange`
+    /// pointing into the mmap region — zero heap allocation for the
+    /// SRS. The mmap is held alive via `Arc<Mmap>`; clones of the
+    /// `ParamsKZG` share the same backing region.
+    ///
+    /// # Format
+    ///
+    /// 64-byte header (little-endian throughout):
+    ///
+    /// ```text
+    ///  0..8   magic              = b"MDNGHTV1"
+    ///  8..12  version: u32       = 1
+    /// 12..16  k: u32
+    /// 16..20  point_size: u32    = size_of::<E::G1>() — guard against layout drift
+    /// 20..24  flags: u32         (bit 0 = has g_lagrange)
+    /// 24..32  reserved
+    /// 32..40  g_offset: u64      = 64
+    /// 40..48  g_count: u64       = 1 << k
+    /// 48..56  g_lagrange_offset: u64
+    /// 56..64  g_lagrange_count: u64
+    /// 64..72  g2_offset: u64
+    /// 72..80  g2_size:   u64
+    /// 80..88  s_g2_offset: u64
+    /// 88..96  s_g2_size: u64
+    /// 96..g_offset   padding (`g_offset` defaults to 128 for SIMD alignment)
+    /// ```
+    ///
+    /// Body: `g` and `g_lagrange` are raw bytes of consecutive `E::G1`
+    /// values in the in-memory representation. `g2` / `s_g2` use the
+    /// `ProcessedSerdeObject::Repr` encoding so the file can be
+    /// produced and consumed without committing to a specific
+    /// `SerdeFormat`.
+    ///
+    /// # Safety
+    ///
+    /// The caller is trusting the file producer to have used the same
+    /// `E::G1` memory layout. The header carries `point_size` so
+    /// mismatched producer / consumer fail-fast with `InvalidData`
+    /// rather than producing UB at MSM time.
+    // Confined `unsafe`: mmap-region pointer arithmetic +
+    // `from_raw_parts`-style slice construction. The invariants are
+    // documented inline; see also `BasesStorage::mapped` SAFETY notes.
+    #[allow(unsafe_code)]
+    pub fn read_mmap_arc(mmap: std::sync::Arc<memmap2::Mmap>) -> io::Result<Self>
+    where
+        E::G2: ProcessedSerdeObject,
+    {
+        const HEADER_LEN: usize = 96;
+        const MAGIC: &[u8; 8] = b"MDNGHTV1";
+
+        let bytes: &[u8] = &mmap[..];
+        if bytes.len() < HEADER_LEN {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "header truncated"));
+        }
+        if &bytes[0..8] != MAGIC {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "bad magic"));
+        }
+        let version = u32::from_le_bytes(bytes[8..12].try_into().unwrap());
+        if version != 1 {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "unsupported version"));
+        }
+        let _k = u32::from_le_bytes(bytes[12..16].try_into().unwrap());
+        let point_size = u32::from_le_bytes(bytes[16..20].try_into().unwrap()) as usize;
+        if point_size != std::mem::size_of::<E::G1>() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "point_size mismatch — companion file built for a different layout",
+            ));
+        }
+        let flags = u32::from_le_bytes(bytes[20..24].try_into().unwrap());
+        let has_g_lagrange = (flags & 0x1) != 0;
+
+        let g_off = u64::from_le_bytes(bytes[32..40].try_into().unwrap()) as usize;
+        let g_count = u64::from_le_bytes(bytes[40..48].try_into().unwrap()) as usize;
+        let gl_off = u64::from_le_bytes(bytes[48..56].try_into().unwrap()) as usize;
+        let gl_count = u64::from_le_bytes(bytes[56..64].try_into().unwrap()) as usize;
+        let g2_off = u64::from_le_bytes(bytes[64..72].try_into().unwrap()) as usize;
+        let g2_size = u64::from_le_bytes(bytes[72..80].try_into().unwrap()) as usize;
+        let s_g2_off = u64::from_le_bytes(bytes[80..88].try_into().unwrap()) as usize;
+        let s_g2_size = u64::from_le_bytes(bytes[88..96].try_into().unwrap()) as usize;
+
+        // Validate ranges
+        let g_end = g_off
+            .checked_add(g_count.checked_mul(point_size).unwrap_or(usize::MAX))
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "g range overflow"))?;
+        if g_end > bytes.len() {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "g overruns file"));
+        }
+        // Alignment check
+        let g_ptr_addr = bytes.as_ptr() as usize + g_off;
+        if g_ptr_addr % std::mem::align_of::<E::G1>() != 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "g not aligned to E::G1",
+            ));
+        }
+        let g_ptr = unsafe { (bytes.as_ptr() as *const u8).add(g_off) as *const E::G1 };
+        let g = unsafe { BasesStorage::mapped(mmap.clone(), g_ptr, g_count) };
+
+        let g_lagrange = if has_g_lagrange {
+            let gl_end = gl_off
+                .checked_add(gl_count.checked_mul(point_size).unwrap_or(usize::MAX))
+                .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "gl range overflow"))?;
+            if gl_end > bytes.len() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "g_lagrange overruns file",
+                ));
+            }
+            let gl_ptr_addr = bytes.as_ptr() as usize + gl_off;
+            if gl_ptr_addr % std::mem::align_of::<E::G1>() != 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "g_lagrange not aligned",
+                ));
+            }
+            let gl_ptr =
+                unsafe { (bytes.as_ptr() as *const u8).add(gl_off) as *const E::G1 };
+            let gl = unsafe { BasesStorage::mapped(mmap.clone(), gl_ptr, gl_count) };
+            OnceLock::from(gl)
+        } else {
+            // g_lagrange absent on disk — first commit_lagrange
+            // will FFT-recompute via `g_lagrange_slice`.
+            OnceLock::new()
+        };
+
+        // g2 / s_g2 use the SerdeFormat encoding, not the raw
+        // in-memory layout — read via `ProcessedSerdeObject::read`.
+        let mut g2_slice = &bytes[g2_off..g2_off + g2_size];
+        let mut s_g2_slice = &bytes[s_g2_off..s_g2_off + s_g2_size];
+        let g2 = E::G2::read(&mut g2_slice, SerdeFormat::RawBytesUnchecked)?;
+        let s_g2 = E::G2::read(&mut s_g2_slice, SerdeFormat::RawBytesUnchecked)?;
+
+        Ok(Self { g, g_lagrange, g2, s_g2 })
+    }
+
+    /// Writes the in-memory `ParamsKZG` to a companion file laid out
+    /// for [`read_mmap_arc`]. Includes both `g` and `g_lagrange`
+    /// (the latter is force-materialised via `g_lagrange_slice`).
+    ///
+    /// Disk cost at BLS12-381 / k=20 / projective storage:
+    /// 64 B header + 2 × 2^20 × 144 B + g2 + s_g2 ≈ 288 MiB. Bigger
+    /// than the original CDN file (which uses 96-byte affine on
+    /// disk) because we mirror the in-memory layout for zero-copy
+    /// loading. Disk is cheap on mobile (94 GB free on the S24);
+    /// the memory win at proof time is the goal.
+    // Confined `unsafe`: reinterprets the `[E::G1]` slice as `[u8]`
+    // for raw bytewise write. Sound because `E::G1` is
+    // `#[repr(transparent)]` over a C-layout struct (verified for
+    // midnight-curves' `G1Projective`).
+    #[allow(unsafe_code)]
+    pub fn write_mmap_companion<W: io::Write>(&self, writer: &mut W) -> io::Result<()>
+    where
+        E::G2: ProcessedSerdeObject,
+        E::G1: ProcessedSerdeObject,
+    {
+        const HEADER_LEN: usize = 96;
+        const G_OFFSET: u64 = 128; // 128-byte alignment for SIMD friendliness
+
+        let n = self.g.len() as u64;
+        let k = self.g.len().ilog2();
+        let point_size = std::mem::size_of::<E::G1>() as u64;
+        let g_block_bytes = n * point_size;
+
+        // Force g_lagrange materialisation so we can write it.
+        let g_lagrange = self.g_lagrange_slice();
+        let gl_count = g_lagrange.len() as u64;
+        let gl_offset = G_OFFSET + g_block_bytes;
+        let gl_block_bytes = gl_count * point_size;
+        let g2_offset = gl_offset + gl_block_bytes;
+        // Serialise g2/s_g2 into temp buffers so we know their sizes.
+        let mut g2_buf = Vec::new();
+        self.g2.write(&mut g2_buf, SerdeFormat::RawBytesUnchecked)?;
+        let mut s_g2_buf = Vec::new();
+        self.s_g2.write(&mut s_g2_buf, SerdeFormat::RawBytesUnchecked)?;
+        let g2_size = g2_buf.len() as u64;
+        let s_g2_offset = g2_offset + g2_size;
+        let s_g2_size = s_g2_buf.len() as u64;
+
+        // Header
+        writer.write_all(b"MDNGHTV1")?;
+        writer.write_all(&1u32.to_le_bytes())?; // version
+        writer.write_all(&k.to_le_bytes())?;
+        writer.write_all(&(point_size as u32).to_le_bytes())?;
+        writer.write_all(&1u32.to_le_bytes())?; // flags: has_g_lagrange
+        writer.write_all(&[0u8; 8])?; // reserved
+        writer.write_all(&G_OFFSET.to_le_bytes())?;
+        writer.write_all(&n.to_le_bytes())?;
+        writer.write_all(&gl_offset.to_le_bytes())?;
+        writer.write_all(&gl_count.to_le_bytes())?;
+        writer.write_all(&g2_offset.to_le_bytes())?;
+        writer.write_all(&g2_size.to_le_bytes())?;
+        writer.write_all(&s_g2_offset.to_le_bytes())?;
+        writer.write_all(&s_g2_size.to_le_bytes())?;
+        // Pad to G_OFFSET
+        let pad = G_OFFSET as usize - HEADER_LEN;
+        writer.write_all(&vec![0u8; pad])?;
+
+        // g block: raw bytes of consecutive E::G1 in memory layout
+        let g_slice: &[E::G1] = &self.g;
+        let g_bytes = unsafe {
+            std::slice::from_raw_parts(
+                g_slice.as_ptr() as *const u8,
+                g_slice.len() * std::mem::size_of::<E::G1>(),
+            )
+        };
+        writer.write_all(g_bytes)?;
+
+        // g_lagrange block
+        let gl_bytes = unsafe {
+            std::slice::from_raw_parts(
+                g_lagrange.as_ptr() as *const u8,
+                g_lagrange.len() * std::mem::size_of::<E::G1>(),
+            )
+        };
+        writer.write_all(gl_bytes)?;
+
+        // g2 / s_g2 — write the serialised buffers we built above
+        writer.write_all(&g2_buf)?;
+        writer.write_all(&s_g2_buf)?;
+
+        Ok(())
     }
 }
 
@@ -562,5 +801,54 @@ mod test {
         params.drop_lazy_bases();
         let recomputed: &[midnight_curves::G1Projective] = params.g_lagrange_slice();
         assert_eq!(eager.as_slice(), recomputed);
+    }
+
+    /// Round-trip a `ParamsKZG` through the companion mmap format.
+    /// Verifies that:
+    ///  1. `write_mmap_companion` produces a file that
+    ///     `read_mmap_arc` accepts;
+    ///  2. The reconstructed `g`, `g_lagrange`, `g2`, `s_g2` all
+    ///     equal the originals byte-for-byte;
+    ///  3. The reconstructed `g` is genuinely backed by the mmap
+    ///     (not silently copied into an owned `Vec`).
+    #[test]
+    fn test_mmap_companion_round_trip() {
+        const K: u32 = 5;
+        use std::io::Write as _;
+        use std::sync::Arc;
+        use midnight_curves::Bls12;
+
+        let params0: ParamsKZG<Bls12> = ParamsKZG::unsafe_setup(K, OsRng);
+
+        // Write to a tempfile so we can mmap it back.
+        let mut tmp = tempfile::NamedTempFile::new().expect("temp file");
+        params0
+            .write_mmap_companion(&mut tmp)
+            .expect("write companion");
+        tmp.flush().expect("flush");
+        let file = tmp.reopen().expect("reopen");
+        // SAFETY: we control the file lifecycle; mmap is read-only.
+        #[allow(unsafe_code)]
+        let mmap = Arc::new(unsafe { memmap2::Mmap::map(&file) }.expect("mmap"));
+
+        let params1 = ParamsKZG::<Bls12>::read_mmap_arc(mmap).expect("read mmap");
+
+        // Equality through the BasesStorage Deref → slice compare.
+        assert_eq!(params0.g.len(), params1.g.len());
+        assert_eq!(&*params0.g, &*params1.g);
+        assert_eq!(
+            params0.g_lagrange_slice(),
+            params1.g_lagrange_slice(),
+        );
+        assert_eq!(params0.g2, params1.g2);
+        assert_eq!(params0.s_g2, params1.s_g2);
+
+        // Confirm the storage really is mmap-backed (not silently
+        // copied) — the whole point of the optimisation.
+        use crate::poly::kzg::bases::BasesStorage;
+        assert!(
+            matches!(params1.g, BasesStorage::Mapped { .. }),
+            "g should be mmap-backed after read_mmap_arc"
+        );
     }
 }

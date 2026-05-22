@@ -36,6 +36,13 @@ harness = false
 ff = { workspace = true }
 group = { workspace = true }
 midnight-curves = { version = "0.2.0" }
+# Memory-mapped SRS support: `read_mmap_arc` constructs a
+# `ParamsKZG` whose `g`/`g_lagrange` are slice views over a file
+# mapping instead of heap Vecs. Saves the ~300 MiB heap
+# allocation for the SRS at k=20 and lets the OS evict cold pages
+# during heavy prove phases. Optional behind no feature flag — the
+# crate compiles + works without anyone calling the mmap path.
+memmap2 = "0.9"
 rand_core = { workspace = true, features = ["getrandom"] }
 tracing = { workspace = true }
 blake2b_simd = { workspace = true }
@@ -52,6 +59,7 @@ num-bigint = { workspace = true }
 [dev-dependencies]
 assert_matches = "1.5"
 proptest = "1"
+tempfile = "3"
 serde_json = { workspace = true }
 midnight-circuits = { path = "../circuits" }
 midnight-zk-stdlib = { path = "../zk_stdlib" }
