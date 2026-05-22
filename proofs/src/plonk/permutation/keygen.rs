@@ -182,7 +182,26 @@ pub(crate) fn build_pk<F: WithSmallOrderMulGroup<3>>(
         });
     }
 
-    let (polys, cosets) = compute_polys_and_cosets::<F>(domain, p, &permutations);
+    // Compute the coefficient-form polys eagerly (~`n_cols × n × 32 B`)
+    // but defer the extended-domain cosets — they're only consumed
+    // inside `compute_h_poly::evaluate_h` and can be lazily
+    // materialised + dropped within that scope. Saves
+    // `~n_cols × 4n × 32 B` keygen-resident heap; at k=20 that's
+    // hundreds of MiB. See the same pattern applied to
+    // `fixed_cosets` in `plonk::keygen::keygen_pk` for the
+    // architectural rationale.
+    let polys = {
+        let mut polys = vec![domain.empty_coeff(); p.columns.len()];
+        crate::utils::arithmetic::parallelize(&mut polys, |o, start| {
+            for (x, poly) in o.iter_mut().enumerate() {
+                let i = start + x;
+                let permutation_poly = permutations[i].clone();
+                *poly = domain.lagrange_to_coeff(permutation_poly);
+            }
+        });
+        polys
+    };
+    let cosets: Vec<_> = Vec::new();
 
     ProvingKey {
         permutations,

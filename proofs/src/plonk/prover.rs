@@ -760,27 +760,44 @@ pub(super) fn compute_h_poly<F: WithSmallOrderMulGroup<3>, CS: PolynomialCommitm
         })
         .collect();
 
-    // Materialise fixed_cosets lazily right here, scoped tight so
-    // the ~`num_fixed_cols × 4n × 32 B` allocation lives only as
-    // long as this `evaluate_h` call. `keygen_pk` deliberately
-    // leaves `pk.fixed_cosets` empty to defer this cost out of
-    // the keygen peak; we pay the extended-FFT once per prove and
-    // drop on scope exit (saves ~600 MiB at k=20).
+    // Materialise fixed_cosets and permutation cosets lazily here,
+    // scoped tight so the ~`(n_fixed_cols + n_perm_cols) × 4n × 32 B`
+    // allocation lives only as long as this `evaluate_h` call.
+    // `keygen_pk` and `permutation::keygen::build_pk` deliberately
+    // leave the cosets vecs empty to defer this cost out of the
+    // keygen peak; we pay the extended-FFT once per prove and drop
+    // on scope exit. At k=20 this saves ~`(50+5) × 32 MiB ≈ 1.7 GiB`
+    // of keygen-resident heap.
     //
-    // If `pk.fixed_cosets` is non-empty we use the cached form
-    // (forward-compat with anyone holding an eager ProvingKey).
-    let computed_cosets;
+    // If the cosets are non-empty (older deserialized PKs) we use
+    // the cached form.
+    let computed_fixed_cosets;
     let fixed_cosets_ref: &[crate::poly::Polynomial<F, ExtendedLagrangeCoeff>] = if pk.fixed_cosets.is_empty() {
-        log_phase("finalise.compute_h_poly.materialise_cosets.start");
-        computed_cosets = pk
+        log_phase("finalise.compute_h_poly.materialise_fixed_cosets.start");
+        computed_fixed_cosets = pk
             .fixed_polys
             .iter()
             .map(|p| pk.vk.domain.coeff_to_extended(p.clone()))
             .collect::<Vec<_>>();
-        log_phase("finalise.compute_h_poly.materialise_cosets.end");
-        &computed_cosets
+        log_phase("finalise.compute_h_poly.materialise_fixed_cosets.end");
+        &computed_fixed_cosets
     } else {
         &pk.fixed_cosets
+    };
+
+    let computed_perm_cosets;
+    let perm_cosets_ref: &[crate::poly::Polynomial<F, ExtendedLagrangeCoeff>] = if pk.permutation.cosets.is_empty() {
+        log_phase("finalise.compute_h_poly.materialise_perm_cosets.start");
+        computed_perm_cosets = pk
+            .permutation
+            .polys
+            .iter()
+            .map(|p| pk.vk.domain.coeff_to_extended(p.clone()))
+            .collect::<Vec<_>>();
+        log_phase("finalise.compute_h_poly.materialise_perm_cosets.end");
+        &computed_perm_cosets
+    } else {
+        &pk.permutation.cosets
     };
 
     // Evaluate the h(X) polynomial
@@ -802,11 +819,11 @@ pub(super) fn compute_h_poly<F: WithSmallOrderMulGroup<3>, CS: PolynomialCommitm
         &pk.l0,
         &pk.l_last,
         &pk.l_active_row,
-        &pk.permutation.cosets,
+        perm_cosets_ref,
     );
-    // `computed_cosets` (if we built it) drops here — releasing
-    // the extended-domain expansion before vanishing.construct and
-    // multi_open run.
+    // `computed_fixed_cosets` / `computed_perm_cosets` (if we built
+    // them) drop here — releasing both extended-domain expansions
+    // before vanishing.construct and multi_open run.
     log_phase("finalise.compute_h_poly.drop_cosets.end");
     h_poly
 }
