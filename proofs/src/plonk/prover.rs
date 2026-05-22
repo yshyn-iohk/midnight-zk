@@ -277,7 +277,55 @@ fn sample_rss_hwm_kb() -> Option<(u64, u64)> {
     rss.zip(hwm)
 }
 
-#[cfg(not(any(target_os = "linux", target_os = "android")))]
+/// macOS / iOS path. There's no `/proc`; use the libc-ish
+/// `mach_task_basic_info` via `getrusage(RUSAGE_SELF)`. Same
+/// `(rss_kb, peak_kb)` return shape so callers don't branch.
+/// We can't read crate-level deps cleanly here, so call libc
+/// directly via the link-shim that ships with the Rust runtime.
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+fn sample_rss_hwm_kb() -> Option<(u64, u64)> {
+    // SAFETY: `getrusage` is async-signal-safe and pure-read; the
+    // `rusage` struct is zero-init then filled by the kernel.
+    #[allow(unsafe_code)]
+    unsafe {
+        extern "C" {
+            fn getrusage(who: i32, usage: *mut Rusage) -> i32;
+        }
+        #[repr(C)]
+        struct Timeval { tv_sec: i64, tv_usec: i32 }
+        #[repr(C)]
+        struct Rusage {
+            ru_utime: Timeval,
+            ru_stime: Timeval,
+            ru_maxrss: i64,        // bytes on macOS
+            ru_ixrss: i64,
+            ru_idrss: i64,
+            ru_isrss: i64,
+            ru_minflt: i64,
+            ru_majflt: i64,
+            ru_nswap: i64,
+            ru_inblock: i64,
+            ru_oublock: i64,
+            ru_msgsnd: i64,
+            ru_msgrcv: i64,
+            ru_nsignals: i64,
+            ru_nvcsw: i64,
+            ru_nivcsw: i64,
+        }
+        let mut u: Rusage = std::mem::zeroed();
+        if getrusage(0 /* RUSAGE_SELF */, &mut u) != 0 {
+            return None;
+        }
+        // macOS reports `ru_maxrss` in bytes. Convert to KiB to
+        // match the Linux semantics. We don't have a true "current
+        // RSS" — `ru_maxrss` is the high-water mark — so report it
+        // as both rss and hwm; callers see them tracking the same.
+        let hwm_kb = (u.ru_maxrss as u64) / 1024;
+        Some((hwm_kb, hwm_kb))
+    }
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "android", target_os = "macos", target_os = "ios")))]
 fn sample_rss_hwm_kb() -> Option<(u64, u64)> {
     None
 }
