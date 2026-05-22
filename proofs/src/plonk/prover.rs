@@ -760,13 +760,36 @@ pub(super) fn compute_h_poly<F: WithSmallOrderMulGroup<3>, CS: PolynomialCommitm
         })
         .collect();
 
+    // Materialise fixed_cosets lazily right here, scoped tight so
+    // the ~`num_fixed_cols × 4n × 32 B` allocation lives only as
+    // long as this `evaluate_h` call. `keygen_pk` deliberately
+    // leaves `pk.fixed_cosets` empty to defer this cost out of
+    // the keygen peak; we pay the extended-FFT once per prove and
+    // drop on scope exit (saves ~600 MiB at k=20).
+    //
+    // If `pk.fixed_cosets` is non-empty we use the cached form
+    // (forward-compat with anyone holding an eager ProvingKey).
+    let computed_cosets;
+    let fixed_cosets_ref: &[crate::poly::Polynomial<F, ExtendedLagrangeCoeff>] = if pk.fixed_cosets.is_empty() {
+        log_phase("finalise.compute_h_poly.materialise_cosets.start");
+        computed_cosets = pk
+            .fixed_polys
+            .iter()
+            .map(|p| pk.vk.domain.coeff_to_extended(p.clone()))
+            .collect::<Vec<_>>();
+        log_phase("finalise.compute_h_poly.materialise_cosets.end");
+        &computed_cosets
+    } else {
+        &pk.fixed_cosets
+    };
+
     // Evaluate the h(X) polynomial
-    pk.ev.evaluate_h::<ExtendedLagrangeCoeff>(
+    let h_poly = pk.ev.evaluate_h::<ExtendedLagrangeCoeff>(
         &pk.vk.domain,
         &pk.vk.cs,
         &advice_cosets.iter().map(|a| a.as_slice()).collect::<Vec<_>>(),
         &instance_cosets.iter().map(|i| i.as_slice()).collect::<Vec<_>>(),
-        &pk.fixed_cosets,
+        fixed_cosets_ref,
         challenges,
         *y,
         *beta,
@@ -780,7 +803,12 @@ pub(super) fn compute_h_poly<F: WithSmallOrderMulGroup<3>, CS: PolynomialCommitm
         &pk.l_last,
         &pk.l_active_row,
         &pk.permutation.cosets,
-    )
+    );
+    // `computed_cosets` (if we built it) drops here — releasing
+    // the extended-domain expansion before vanishing.construct and
+    // multi_open run.
+    log_phase("finalise.compute_h_poly.drop_cosets.end");
+    h_poly
 }
 
 pub(super) fn write_evals_to_transcript<F, CS, T>(

@@ -339,10 +339,19 @@ where
         fixed.par_iter().map(|poly| vk.domain.lagrange_to_coeff(poly.clone())).collect();
     crate::plonk::prover::log_phase_pub("keygen_pk.fixed_polys.end");
 
-    let fixed_cosets = fixed_polys
-        .par_iter()
-        .map(|poly| vk.domain.coeff_to_extended(poly.clone()))
-        .collect();
+    // Defer fixed_cosets construction to per-prove. They're only
+    // consumed inside `compute_h_poly`'s `evaluate_h` call; building
+    // them once per prove and dropping immediately after means they
+    // never coreside with the rest of the prove's working set
+    // (multi_open MSM scratch, h_pieces, advice columns in extended
+    // form, etc.) — peak drops by ~size_of(fixed_cosets) which at
+    // k=20 is ~600 MiB.
+    //
+    // Trade: every prove pays the extended-FFT cost for each fixed
+    // column. ~10ms × column count at k=18 on a fast desktop;
+    // dozens of seconds at k=20 on mobile. Per the project brief,
+    // memory beats CPU.
+    let fixed_cosets: Vec<_> = Vec::new();
     crate::plonk::prover::log_phase_pub("keygen_pk.fixed_cosets.end");
 
     let permutation_pk = assembly.permutation.build_pk::<F>(&vk.domain, &cs.permutation);
