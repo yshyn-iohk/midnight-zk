@@ -914,10 +914,27 @@ pub(super) fn compute_h_poly<F: WithSmallOrderMulGroup<3>, CS: PolynomialCommitm
     // Forward-compat: if the ProvingKey carries a pre-built
     // cached `fixed_cosets` / `permutation.cosets` (from an older
     // eager-keygen path or a deserialised PK), use it as-is.
+    // Only spill at high `k`. At small `k` the entire coset
+    // collection fits comfortably in heap; round-tripping through
+    // a tempfile is pure overhead (measured: +46–47 % prove
+    // time at k=16/17 on a Samsung S24 Ultra when the wallet
+    // unconditionally set `MIDNIGHT_SPILL_COSETS=1`). The
+    // mobile wallet sets the env var at process start regardless
+    // of `k`; the cheap fix is to gate the spill on `k` here so
+    // small-k proves keep their in-memory fast path.
+    //
+    // Override the floor with `MIDNIGHT_SPILL_FLOOR_K`. Set to
+    // `0` to spill at every `k` (useful for testing the spill
+    // path directly).
+    const DEFAULT_SPILL_FLOOR_K: u32 = 18;
+    let spill_floor_k: u32 = std::env::var("MIDNIGHT_SPILL_FLOOR_K")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(DEFAULT_SPILL_FLOOR_K);
     let want_spill = matches!(
         std::env::var("MIDNIGHT_SPILL_COSETS").as_deref(),
         Ok("1") | Ok("true")
-    );
+    ) && pk.vk.domain.k() >= spill_floor_k;
 
     let computed_fixed_cosets;
     let spilled_fixed_cosets;
