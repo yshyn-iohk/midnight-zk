@@ -43,6 +43,13 @@ midnight-curves = { version = "0.2.0" }
 # during heavy prove phases. Optional behind no feature flag — the
 # crate compiles + works without anyone calling the mmap path.
 memmap2 = "0.9"
+# Disk-backed coset spill at proof-time. `compute_h_poly` opt-in
+# (via MIDNIGHT_SPILL_COSETS=1) writes each extended-domain coset
+# to a tempfile one at a time, drops the in-memory poly, then
+# mmaps the file as a slice view for evaluate_h. Lets multi-GiB
+# extended polynomials never coreside in heap — the unlock for
+# k≥20 on a 6 GiB-limited mobile device.
+tempfile = "3"
 rand_core = { workspace = true, features = ["getrandom"] }
 tracing = { workspace = true }
 blake2b_simd = { workspace = true }
