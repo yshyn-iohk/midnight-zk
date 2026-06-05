@@ -110,8 +110,12 @@ where
 /// Wrapper over the MSM function to use the blstrs underlying function
 pub fn msm_specific<C: CurveAffine>(coeffs: &[C::Scalar], bases: &[C::Curve]) -> C::Curve {
     // We empirically checked that for MSMs larger than 2**18, the blstrs
-    // implementation regresses.
-    if coeffs.len() <= (2 << 18) && TypeId::of::<C>() == TypeId::of::<midnight_curves::G1Affine>() {
+    // implementation regresses on x86.  On modern aarch64 (Apple M-series,
+    // A17/A18) the blstrs fast path keeps winning well past 2^20 because its
+    // hand-tuned Pippenger + threadpool dominate the generic `msm_best`.
+    // Raise the gate to 2^21 so k=21 (n = 1 048 576 ≤ 2 097 152) stays on
+    // the fast path.  See docs/k21-plan.md (proposal 1).
+    if coeffs.len() <= (1 << 21) && TypeId::of::<C>() == TypeId::of::<midnight_curves::G1Affine>() {
         // Safe: we just checked type
         let coeffs = unsafe { &*(coeffs as *const _ as *const [Fq]) };
         let bases = unsafe { &*(bases as *const _ as *const [G1Projective]) };
