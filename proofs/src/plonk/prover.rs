@@ -10,6 +10,13 @@ use std::{
 
 use ff::{Field, FromUniformBytes, PrimeField, WithSmallOrderMulGroup};
 use rand_core::{CryptoRng, RngCore};
+// par_iter swap (k21 iter-3 / parallelism-doc P1): wrap the per-column
+// coset / lagrange_to_coeff loops in rayon so the column-level
+// parallelism complements the FFT-internal parallelism rayon already
+// does inside `best_fft`. Sequential `.iter().map(coeff_to_extended)`
+// loops are the reason the effective core-count was ~2 of 11 rayon
+// threads in pre-experiment measurements.
+use rayon::iter::{IntoParallelIterator, IntoParallelRefIterator, ParallelIterator};
 
 use super::{
     circuit::{
@@ -223,11 +230,18 @@ where
     let (instance_polys, instance_values) =
         instance.into_iter().map(|i| (i.instance_polys, i.instance_values)).unzip();
 
+    // par_iter (P1): the inner `lagrange_to_coeff` loop runs an iFFT
+    // per advice column. At k=20 there are ~30 columns and each iFFT
+    // is itself rayon-parallel — but the outer .into_iter() forced
+    // them to run sequentially, leaving rayon threads idle during the
+    // FFT's serial bit-reversal + twiddle prologue. into_par_iter()
+    // schedules columns across the pool so the prologue phases overlap.
+    // Outer is per-instance (usually 1); we keep .into_iter() there.
     let advice_polys = advice
         .into_iter()
         .map(|a| {
             a.advice_polys
-                .into_iter()
+                .into_par_iter()
                 .map(|p| domain.lagrange_to_coeff(p))
                 .collect::<Vec<_>>()
         })
@@ -929,8 +943,10 @@ pub(super) fn compute_h_poly<F: WithSmallOrderMulGroup<3>, CS: PolynomialCommitm
                 CosetsForInstance::Spilled(s)
             } else {
                 CosetsForInstance::InMem(
+                    // par_iter (P1): column-level parallelism on top
+                    // of the inner FFT's own parallelism.
                     advice_polys
-                        .iter()
+                        .par_iter()
                         .map(|poly| pk.vk.get_domain().coeff_to_extended(poly.clone()))
                         .collect(),
                 )
@@ -948,8 +964,10 @@ pub(super) fn compute_h_poly<F: WithSmallOrderMulGroup<3>, CS: PolynomialCommitm
                 CosetsForInstance::Spilled(s)
             } else {
                 CosetsForInstance::InMem(
+                    // par_iter (P1): column-level parallelism on top
+                    // of the inner FFT's own parallelism.
                     instance_polys
-                        .iter()
+                        .par_iter()
                         .map(|poly| pk.vk.get_domain().coeff_to_extended(poly.clone()))
                         .collect(),
                 )
@@ -1007,9 +1025,10 @@ pub(super) fn compute_h_poly<F: WithSmallOrderMulGroup<3>, CS: PolynomialCommitm
             spilled_fixed_cosets.as_slice()
         } else {
             log_phase("finalise.compute_h_poly.materialise_fixed_cosets.start");
+            // par_iter (P1)
             computed_fixed_cosets = pk
                 .fixed_polys
-                .iter()
+                .par_iter()
                 .map(|p| pk.vk.domain.coeff_to_extended(p.clone()))
                 .collect::<Vec<_>>();
             log_phase("finalise.compute_h_poly.materialise_fixed_cosets.end");
@@ -1030,10 +1049,11 @@ pub(super) fn compute_h_poly<F: WithSmallOrderMulGroup<3>, CS: PolynomialCommitm
             spilled_perm_cosets.as_slice()
         } else {
             log_phase("finalise.compute_h_poly.materialise_perm_cosets.start");
+            // par_iter (P1)
             computed_perm_cosets = pk
                 .permutation
                 .polys
-                .iter()
+                .par_iter()
                 .map(|p| pk.vk.domain.coeff_to_extended(p.clone()))
                 .collect::<Vec<_>>();
             log_phase("finalise.compute_h_poly.materialise_perm_cosets.end");
