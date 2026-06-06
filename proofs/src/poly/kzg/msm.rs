@@ -122,9 +122,44 @@ pub fn msm_specific<C: CurveAffine>(coeffs: &[C::Scalar], bases: &[C::Curve]) ->
         let res = G1Projective::multi_exp(bases, coeffs);
         unsafe { std::mem::transmute_copy(&res) }
     } else {
-        let mut affine_bases = vec![C::identity(); coeffs.len()];
-        C::Curve::batch_normalize(bases, &mut affine_bases);
-        msm_best(coeffs, &affine_bases)
+        // S3 (k21-iter-3): chunked-Pippenger fallback. The default
+        // path allocates `affine_bases: Vec<C> = vec![identity; n]`
+        // (192 MiB at n=2^21, 384 MiB at n=2^22) and then `msm_best`
+        // internally allocates another `bases_local: Vec<Affine<F>>`
+        // of the same size — at k=22 that's 768 MiB per MSM call.
+        //
+        // Pippenger composes naturally over chunks: split coeffs/bases
+        // into fixed-size chunks, run msm_best on each, sum the
+        // partial G1Projective results. Per-chunk peak heap drops to
+        // ~24 MiB (256K bases × 96 B) regardless of total n. Trade:
+        // a few % more CPU because msm_best's window size `c` is
+        // chosen per-chunk and a smaller `c` does more total windows.
+        //
+        // Override the chunk size with `MIDNIGHT_MSM_CHUNK_LOG2` (an
+        // integer; final chunk size = `1 << that`). Set to a large
+        // value (e.g. 32) to disable chunking entirely.
+        const DEFAULT_CHUNK_LOG2: u32 = 18;
+        let chunk_log2: u32 = std::env::var("MIDNIGHT_MSM_CHUNK_LOG2")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(DEFAULT_CHUNK_LOG2);
+        let chunk: usize = 1usize << chunk_log2;
+
+        if coeffs.len() <= chunk {
+            let mut affine_bases = vec![C::identity(); coeffs.len()];
+            C::Curve::batch_normalize(bases, &mut affine_bases);
+            return msm_best(coeffs, &affine_bases);
+        }
+
+        let mut acc = C::Curve::identity();
+        for (c_chunk, b_chunk) in coeffs.chunks(chunk).zip(bases.chunks(chunk)) {
+            let mut affine_chunk = vec![C::identity(); c_chunk.len()];
+            C::Curve::batch_normalize(b_chunk, &mut affine_chunk);
+            acc = acc + msm_best(c_chunk, &affine_chunk);
+            // affine_chunk + msm_best's bases_local drop here, freeing
+            // ~48 MiB before the next iteration allocates.
+        }
+        acc
     }
 }
 
