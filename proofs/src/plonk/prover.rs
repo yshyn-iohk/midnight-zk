@@ -877,23 +877,83 @@ pub(super) fn compute_h_poly<F: WithSmallOrderMulGroup<3>, CS: PolynomialCommitm
         y,
         ..
     } = &trace;
-    // Calculate the advice and instance cosets
-    let advice_cosets: Vec<Vec<Polynomial<F, ExtendedLagrangeCoeff>>> = advice_polys
+
+    // ── streaming-iteration-3 S1 ──
+    // The advice + instance per-instance coset arrays are the single
+    // biggest unspilled allocation in `finalise_proof`. At k=21 with
+    // ~30 advice cols + extended_factor=8 the eager Vec<Vec<Polynomial>>
+    // is ~7.7 GiB coresident — directly responsible for the bulk of the
+    // pre-S1 phys_footprint we measured (8.3 GiB iOS sim, commit
+    // 7b6f7a5). Same env-var gating as fixed/perm cosets:
+    // `MIDNIGHT_SPILL_COSETS=1` + `MIDNIGHT_SPILL_FLOOR_K` (default 18).
+    //
+    // Spill path: each instance's advice (or instance) polys go through
+    // `spill_cosets_to_disk` → a `SpilledCosets<F>` that holds an mmap
+    // arc and `Polynomial` views into the mapped pages. Drop of the
+    // whole `Vec<CosetsForInstance>` cleans the tempfile up.
+    //
+    // In-memory path stays the default for hosts with abundant RAM
+    // (and for low-k where the spill IO overhead isn't worth it).
+    const DEFAULT_SPILL_FLOOR_K: u32 = 18;
+    let spill_floor_k: u32 = std::env::var("MIDNIGHT_SPILL_FLOOR_K")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(DEFAULT_SPILL_FLOOR_K);
+    let want_spill_advice = matches!(
+        std::env::var("MIDNIGHT_SPILL_COSETS").as_deref(),
+        Ok("1") | Ok("true")
+    ) && pk.vk.domain.k() >= spill_floor_k;
+
+    enum CosetsForInstance<F: WithSmallOrderMulGroup<3>> {
+        InMem(Vec<Polynomial<F, ExtendedLagrangeCoeff>>),
+        Spilled(SpilledCosets<F>),
+    }
+    impl<F: WithSmallOrderMulGroup<3>> CosetsForInstance<F> {
+        fn as_slice(&self) -> &[Polynomial<F, ExtendedLagrangeCoeff>] {
+            match self {
+                Self::InMem(v) => v.as_slice(),
+                Self::Spilled(s) => s.as_slice(),
+            }
+        }
+    }
+
+    // Calculate the advice and instance cosets.
+    let advice_cosets: Vec<CosetsForInstance<F>> = advice_polys
         .iter()
         .map(|advice_polys| {
-            advice_polys
-                .iter()
-                .map(|poly| pk.vk.get_domain().coeff_to_extended(poly.clone()))
-                .collect()
+            if want_spill_advice {
+                log_phase("finalise.compute_h_poly.spill_advice_cosets.start");
+                let s = spill_cosets_to_disk(advice_polys, &pk.vk.domain)
+                    .expect("spill advice_cosets to tempfile");
+                log_phase("finalise.compute_h_poly.spill_advice_cosets.end");
+                CosetsForInstance::Spilled(s)
+            } else {
+                CosetsForInstance::InMem(
+                    advice_polys
+                        .iter()
+                        .map(|poly| pk.vk.get_domain().coeff_to_extended(poly.clone()))
+                        .collect(),
+                )
+            }
         })
         .collect();
-    let instance_cosets: Vec<Vec<Polynomial<F, ExtendedLagrangeCoeff>>> = instance_polys
+    let instance_cosets: Vec<CosetsForInstance<F>> = instance_polys
         .iter()
         .map(|instance_polys| {
-            instance_polys
-                .iter()
-                .map(|poly| pk.vk.get_domain().coeff_to_extended(poly.clone()))
-                .collect()
+            if want_spill_advice {
+                log_phase("finalise.compute_h_poly.spill_instance_cosets.start");
+                let s = spill_cosets_to_disk(instance_polys, &pk.vk.domain)
+                    .expect("spill instance_cosets to tempfile");
+                log_phase("finalise.compute_h_poly.spill_instance_cosets.end");
+                CosetsForInstance::Spilled(s)
+            } else {
+                CosetsForInstance::InMem(
+                    instance_polys
+                        .iter()
+                        .map(|poly| pk.vk.get_domain().coeff_to_extended(poly.clone()))
+                        .collect(),
+                )
+            }
         })
         .collect();
 
@@ -926,15 +986,13 @@ pub(super) fn compute_h_poly<F: WithSmallOrderMulGroup<3>, CS: PolynomialCommitm
     // Override the floor with `MIDNIGHT_SPILL_FLOOR_K`. Set to
     // `0` to spill at every `k` (useful for testing the spill
     // path directly).
-    const DEFAULT_SPILL_FLOOR_K: u32 = 18;
-    let spill_floor_k: u32 = std::env::var("MIDNIGHT_SPILL_FLOOR_K")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(DEFAULT_SPILL_FLOOR_K);
-    let want_spill = matches!(
-        std::env::var("MIDNIGHT_SPILL_COSETS").as_deref(),
-        Ok("1") | Ok("true")
-    ) && pk.vk.domain.k() >= spill_floor_k;
+    //
+    // S1 (iteration 3): the spill_floor_k / want_spill computation
+    // also drives the advice/instance cosets spill earlier in this
+    // function. Reuse `want_spill_advice` here as the shared spill
+    // gate so all four coset categories (fixed/perm/advice/instance)
+    // follow the same env-var contract.
+    let want_spill = want_spill_advice;
 
     let computed_fixed_cosets;
     let spilled_fixed_cosets;
