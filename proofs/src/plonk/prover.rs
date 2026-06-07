@@ -2,10 +2,7 @@ use std::{
     collections::{BTreeSet, HashMap, HashSet},
     hash::Hash,
     iter,
-    marker::PhantomData,
-    mem::ManuallyDrop,
     ops::RangeTo,
-    sync::Arc,
 };
 
 use ff::{Field, FromUniformBytes, PrimeField, WithSmallOrderMulGroup};
@@ -139,7 +136,7 @@ where
                         domain,
                         theta,
                         &advice.advice_polys,
-                        &pk.fixed_values,
+                        pk.fixed_values_slice(),
                         &instance.instance_values,
                         &challenges,
                         &mut rng,
@@ -169,7 +166,7 @@ where
                 pk,
                 &pk.permutation,
                 &advice.advice_polys,
-                &pk.fixed_values,
+                pk.fixed_values_slice(),
                 &instance.instance_values,
                 beta,
                 gamma,
@@ -211,7 +208,7 @@ where
                         domain,
                         trash_challenge,
                         &advice.advice_polys,
-                        &pk.fixed_values,
+                        pk.fixed_values_slice(),
                         &instance.instance_values,
                         &challenges,
                         transcript,
@@ -354,52 +351,25 @@ fn sample_rss_hwm_kb() -> Option<(u64, u64)> {
 /// call; `hwm_mb` is the high-water mark across the process
 /// lifetime so far. Together they show which phase is responsible
 /// for each step-up in peak memory.
-/// Holder for cosets that were built one-by-one, written to a
-/// tempfile, then mmap'd. The `polys` vec contains `Polynomial<F>`
-/// instances whose `values: Vec<F>` are *non-owning* views into
-/// the mmap region — they MUST NOT be dropped normally (a Vec drop
-/// would call the allocator's `free` on a pointer the allocator
-/// doesn't own). We wrap them in `ManuallyDrop` to suppress the
-/// destructor and let the `Arc<Mmap>` clean up the actual storage.
+/// Type alias for the cosets-spill use case. Cosets live in
+/// `ExtendedLagrangeCoeff` form, so the underlying generic holder
+/// is parameterised that way.
 ///
-/// `as_slice` returns `&[Polynomial<F, ExtendedLagrangeCoeff>]` —
-/// the layout-transparent transmute is sound because
-/// `ManuallyDrop<T>` is `#[repr(transparent)]` over T, and
-/// `evaluate_h` only reads the slice (never mutates / drops
-/// elements through `&[T]`).
-///
-/// The tempfile is deleted on drop via the `TempPath` it holds.
-pub(super) struct SpilledCosets<F> {
-    _mmap: Arc<memmap2::Mmap>,
-    polys: Vec<ManuallyDrop<Polynomial<F, ExtendedLagrangeCoeff>>>,
-    _tmp_path: tempfile::TempPath,
-}
+/// See [`super::mmap_pk::MmappedPolys`] for the implementation. The
+/// pattern (mmap'd tempfile + `ManuallyDrop` Polynomial views) is
+/// now the canonical spill primitive in this crate, reused both by
+/// the live coset-build path here and by the S5 PK-load path
+/// (`docs/k21-s5-mmap-pk-design.md`).
+pub(super) type SpilledCosets<F> = super::mmap_pk::MmappedPolys<F, ExtendedLagrangeCoeff>;
 
-impl<F> SpilledCosets<F> {
-    pub(super) fn as_slice(&self) -> &[Polynomial<F, ExtendedLagrangeCoeff>] {
-        // SAFETY: ManuallyDrop<T> is #[repr(transparent)]; layout
-        // is identical to T. We expose only `&[T]` (immutable
-        // shared access); no destructors or moves occur through
-        // this slice. The underlying mmap is kept alive by `_mmap`.
-        #[allow(unsafe_code)]
-        unsafe {
-            std::slice::from_raw_parts(
-                self.polys.as_ptr() as *const Polynomial<F, ExtendedLagrangeCoeff>,
-                self.polys.len(),
-            )
-        }
-    }
-}
-
-/// Build cosets one at a time, write each to `tmp`, drop before
-/// the next is built. After all are written, mmap the file and
-/// produce `Polynomial<F>` views over the mapped pages.
+/// Build the extended-domain coset for each input polynomial,
+/// streaming each to a tempfile and dropping it before the next is
+/// built — then mmap the tempfile and return Polynomial views.
 ///
-/// Peak heap during the build is one coset (~`4n × size_of(F)`
-/// bytes) plus the destination Vec being assembled — at k=20 with
-/// 50 fixed columns, the per-column transient is ~128 MiB whereas
-/// the previous lazy `.collect()` would have held all 50 ×
-/// 128 MiB = 6.4 GiB at once.
+/// Peak transient heap stays at ~1 coset (~`4n × size_of(F)` bytes).
+/// At k=20 with 50 fixed columns the per-column transient is ~128 MiB
+/// whereas the previous lazy `.collect()` held all 50 × 128 MiB =
+/// 6.4 GiB at once.
 pub(super) fn spill_cosets_to_disk<F>(
     polys: &[Polynomial<F, Coeff>],
     domain: &crate::poly::EvaluationDomain<F>,
@@ -407,85 +377,11 @@ pub(super) fn spill_cosets_to_disk<F>(
 where
     F: WithSmallOrderMulGroup<3>,
 {
-    use std::io::Write as _;
-
     let coset_size = polys
         .first()
         .map(|_| 1usize << domain.extended_k())
         .unwrap_or(0);
-    let elem_size = std::mem::size_of::<F>();
-
-    // Allow overriding the spill directory via `MIDNIGHT_SPILL_DIR`.
-    // Useful on devices where the default `TMPDIR` partition is too
-    // small (e.g. Android emulator's `/data/local/tmp`, which is
-    // often <1 GiB and may already be filled with pushed SRS files).
-    // The directory must exist and be writable; falls back to the
-    // platform default if the env var is unset or empty.
-    let mut builder = tempfile::Builder::new();
-    builder.prefix("midnight-cosets-");
-    let mut tmp = match std::env::var("MIDNIGHT_SPILL_DIR") {
-        Ok(dir) if !dir.is_empty() => builder.tempfile_in(dir)?,
-        _ => builder.tempfile()?,
-    };
-    {
-        let mut writer = std::io::BufWriter::new(&mut tmp);
-        for p in polys.iter() {
-            let coset = domain.coeff_to_extended(p.clone());
-            // SAFETY: F is Copy + repr(transparent) over a fixed-size
-            // integer array (BLS scalar = [u64; 4]); the in-memory
-            // representation is stable and serialisable as raw bytes.
-            // `coset.values` is a live Vec<F> we built this iteration.
-            #[allow(unsafe_code)]
-            let bytes = unsafe {
-                std::slice::from_raw_parts(
-                    coset.values.as_ptr() as *const u8,
-                    coset.values.len() * elem_size,
-                )
-            };
-            writer.write_all(bytes)?;
-            // `coset` drops here, freeing ~`4n × size_of(F)` bytes
-            // before the next iteration allocates.
-        }
-        writer.flush()?;
-    }
-    let (file, tmp_path) = tmp.into_parts();
-    // SAFETY: read-only mmap of a file we just wrote and own.
-    #[allow(unsafe_code)]
-    let mmap = unsafe { memmap2::Mmap::map(&file) }?;
-    let mmap_arc = Arc::new(mmap);
-
-    // Build non-owning Polynomial views into the mmap region.
-    let n_polys = polys.len();
-    let mut polys_view = Vec::with_capacity(n_polys);
-    let base_ptr = mmap_arc.as_ptr() as *const F;
-    for i in 0..n_polys {
-        // SAFETY: the file holds exactly n_polys consecutive blocks
-        // of `coset_size × elem_size` bytes, written above. The
-        // returned `Vec<F>` is wrapped in ManuallyDrop so its
-        // allocator-aware destructor never runs; the mmap region
-        // is freed when `_mmap` (the Arc) drops at end of scope.
-        // The pointer is `add(i * coset_size)` so each Polynomial
-        // gets a disjoint, valid byte range.
-        #[allow(unsafe_code)]
-        let ptr = unsafe { base_ptr.add(i * coset_size) as *mut F };
-        // SAFETY: `Vec::from_raw_parts` with cap == len means the
-        // Vec believes it owns exactly `coset_size` elements at
-        // `ptr`. We immediately wrap in ManuallyDrop so the Vec's
-        // destructor (which would call `free(ptr)`) never runs.
-        #[allow(unsafe_code)]
-        let values = unsafe { Vec::from_raw_parts(ptr, coset_size, coset_size) };
-        let poly = Polynomial::<F, ExtendedLagrangeCoeff> {
-            values,
-            _marker: PhantomData,
-        };
-        polys_view.push(ManuallyDrop::new(poly));
-    }
-
-    Ok(SpilledCosets {
-        _mmap: mmap_arc,
-        polys: polys_view,
-        _tmp_path: tmp_path,
-    })
+    super::mmap_pk::spill_with_transform(polys, coset_size, |p| domain.coeff_to_extended(p.clone()))
 }
 
 fn log_phase(name: &'static str) {
@@ -1019,15 +915,18 @@ pub(super) fn compute_h_poly<F: WithSmallOrderMulGroup<3>, CS: PolynomialCommitm
             &pk.fixed_cosets
         } else if want_spill {
             log_phase("finalise.compute_h_poly.spill_fixed_cosets.start");
-            spilled_fixed_cosets = spill_cosets_to_disk(&pk.fixed_polys, &pk.vk.domain)
+            // S5 (P2): read through `fixed_polys_slice()` so the
+            // mmap-backed sidecar is consulted first when engaged.
+            spilled_fixed_cosets = spill_cosets_to_disk(pk.fixed_polys_slice(), &pk.vk.domain)
                 .expect("spill fixed_cosets to tempfile");
             log_phase("finalise.compute_h_poly.spill_fixed_cosets.end");
             spilled_fixed_cosets.as_slice()
         } else {
             log_phase("finalise.compute_h_poly.materialise_fixed_cosets.start");
-            // par_iter (P1)
+            // par_iter (P1) — read through `fixed_polys_slice()` so
+            // the S5 mmap-backed sidecar is consulted first.
             computed_fixed_cosets = pk
-                .fixed_polys
+                .fixed_polys_slice()
                 .par_iter()
                 .map(|p| pk.vk.domain.coeff_to_extended(p.clone()))
                 .collect::<Vec<_>>();
@@ -1043,16 +942,16 @@ pub(super) fn compute_h_poly<F: WithSmallOrderMulGroup<3>, CS: PolynomialCommitm
         } else if want_spill {
             log_phase("finalise.compute_h_poly.spill_perm_cosets.start");
             spilled_perm_cosets =
-                spill_cosets_to_disk(&pk.permutation.polys, &pk.vk.domain)
+                spill_cosets_to_disk(pk.permutation_polys_slice(), &pk.vk.domain)
                     .expect("spill permutation cosets to tempfile");
             log_phase("finalise.compute_h_poly.spill_perm_cosets.end");
             spilled_perm_cosets.as_slice()
         } else {
             log_phase("finalise.compute_h_poly.materialise_perm_cosets.start");
-            // par_iter (P1)
+            // par_iter (P1) — read through `permutation_polys_slice()`
+            // so the S5-P3 mmap-backed sidecar is consulted first.
             computed_perm_cosets = pk
-                .permutation
-                .polys
+                .permutation_polys_slice()
                 .par_iter()
                 .map(|p| pk.vk.domain.coeff_to_extended(p.clone()))
                 .collect::<Vec<_>>();
@@ -1137,7 +1036,10 @@ where
         .fixed_queries
         .iter()
         .map(|&(column, at)| {
-            eval_polynomial(&pk.fixed_polys[column.index()], domain.rotate_omega(x, at))
+            eval_polynomial(
+                &pk.fixed_polys_slice()[column.index()],
+                domain.rotate_omega(x, at),
+            )
         })
         .collect();
 
@@ -1201,7 +1103,7 @@ pub(super) fn compute_queries<
         .chain(
             pk.vk.cs.fixed_queries.iter().map(move |&(column, at)| ProverQuery {
                 point: domain.rotate_omega(x, at),
-                poly: &pk.fixed_polys[column.index()],
+                poly: &pk.fixed_polys_slice()[column.index()],
             }),
         )
         .chain(pk.permutation.open(x))

@@ -372,6 +372,15 @@ where
         fixed_cosets,
         permutation: permutation_pk,
         ev,
+        // S5 (P2+P3): fresh keygen produces heap polys; spill
+        // happens on `ProvingKey::read` (or by explicit
+        // `spill_*_to_mmap` calls) — not here, because the result
+        // of keygen is typically immediately serialised and re-read
+        // by the cache layer, so spilling now would waste a
+        // roundtrip.
+        fixed_polys_mmap: None,
+        fixed_values_mmap: None,
+        permutation_polys_mmap: None,
     })
 }
 
