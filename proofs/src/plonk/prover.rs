@@ -384,7 +384,39 @@ where
     super::mmap_pk::spill_with_transform(polys, coset_size, |p| domain.coeff_to_extended(p.clone()))
 }
 
+// R3 — cooperative cancellation flag. The FFI host (or any other
+// caller) sets this to `true` to request the prover abort at the
+// next phase boundary. The prover checks the flag inside
+// `log_phase` and panics with a specific sentinel message that
+// the FFI's `catch_unwind` recognises and maps to
+// `ProverError::Cancelled`. Reset to `false` at the start of
+// every prove call (the FFI is responsible).
+//
+// Granularity is one phase (≈10-30 phase boundaries per prove
+// at k=21); fine enough for "stop within a few seconds" UX
+// without threading a `cancel_token` parameter through every
+// internal call.
+/// R3 — cooperative cancel flag. Setting to `true` causes the
+/// next `log_phase` boundary to panic with the sentinel; the FFI's
+/// `catch_unwind` maps the panic to `ProverError::Cancelled`. The
+/// flag is auto-reset by the FFI on every fresh prove call.
+#[allow(non_upper_case_globals)]
+pub static MIDNIGHT_CANCEL: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// R3 — sentinel message the prover panics with when MIDNIGHT_CANCEL
+/// is observed set. The FFI's catch_unwind path matches this
+/// substring to map the panic to `ProverError::Cancelled` instead
+/// of `ProverError::ProveFailed`.
+pub const MIDNIGHT_CANCEL_SENTINEL: &str = "MIDNIGHT_CANCELLED_BY_HOST";
+
 fn log_phase(name: &'static str) {
+    // R3 — check cooperative cancellation flag first. If set,
+    // panic with the sentinel — the FFI catch_unwind will
+    // recognise + map to ProverError::Cancelled.
+    if MIDNIGHT_CANCEL.load(std::sync::atomic::Ordering::Relaxed) {
+        panic!("{MIDNIGHT_CANCEL_SENTINEL}: cancelled at phase {name}");
+    }
     if let Some((rss_kb, hwm_kb)) = sample_rss_hwm_kb() {
         tracing::info!(
             target: "midnight_bench",
