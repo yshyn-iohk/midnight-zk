@@ -18,6 +18,8 @@ use rayon::iter::{
     IndexedParallelIterator, IntoParallelIterator, IntoParallelRefIterator, ParallelIterator,
 };
 
+/// Storage backing for the SRS bases (owned or memory-mapped)
+pub mod bases;
 /// KZG commitment type
 pub mod commitment;
 /// Multiscalar multiplication engines

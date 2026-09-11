@@ -43,11 +43,20 @@ rayon = { workspace = true }
 criterion = { version = "0.8", optional = true }
 rustc-hash = "2"
 
+# Memory-mapped SRS support. `ParamsKZG::read_mmap_arc` constructs a
+# `ParamsKZG` whose `g`/`g_lagrange` are slice views over a file mapping
+# instead of heap Vecs, saving ~144 MiB per materialised basis at k=20 and
+# letting the OS evict cold pages under pressure. No feature flag - the
+# crate compiles and works without anyone calling the mmap path.
+memmap2 = "0.9"
+
 # Developer tooling dependencies
 tabbycat = { version = "0.1", features = ["attributes"], optional = true }
 num-bigint = { workspace = true }
 
 [dev-dependencies]
+# Round-trip tests for write_mmap_companion / read_mmap_arc.
+tempfile = "3"
 assert_matches = "1.5"
 proptest = "1"
 serde_json = { workspace = true }
