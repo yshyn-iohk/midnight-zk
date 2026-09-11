@@ -1,5 +1,6 @@
 use std::{fmt::Debug, io};
 
+use crate::poly::kzg::bases::BasesStorage;
 use ff::{Field, PrimeField};
 use group::{Curve, Group, GroupEncoding, prime::PrimeCurveAffine};
 use midnight_curves::{
@@ -20,18 +21,18 @@ use crate::{
 /// These are the public parameters for the polynomial commitment scheme.
 #[derive(Debug, Clone)]
 pub struct ParamsKZG<E: Engine> {
-    pub(crate) g: Vec<E::G1Affine>,
-    pub(crate) g_lagrange: Vec<E::G1Affine>,
+    pub(crate) g: BasesStorage<E::G1Affine>,
+    pub(crate) g_lagrange: BasesStorage<E::G1Affine>,
     /// Suffix-sum of `g_lagrange`:
     /// `g_lagrange_delta[i] = sum_{j=i}^{n-1} g_lagrange[j]`.
-    pub(crate) g_lagrange_delta: Vec<E::G1Affine>,
+    pub(crate) g_lagrange_delta: BasesStorage<E::G1Affine>,
     /// Suffix-sum of `g_lagrange_delta`:
     /// `g_lagrange_double_delta[i] = sum_{j=i}^{n-1} g_lagrange_delta[j]`.
     /// Used as the SRS for the `LagrangeDoubleDelta` basis. Same derivation
     /// as `g_lagrange_delta`, applied a second time:
     /// `sum_j a_j · L_j = sum_i c_i · g_lagrange_double_delta[i]`,
     /// where `c_i = b_i - b_{i-1}` and `b_i = a_i - a_{i-1}`.
-    pub(crate) g_lagrange_double_delta: Vec<E::G1Affine>,
+    pub(crate) g_lagrange_double_delta: BasesStorage<E::G1Affine>,
     pub(crate) g2: E::G2,
     pub(crate) s_g2: E::G2,
 }
@@ -100,10 +101,10 @@ where
 
         let n = 1 << new_k;
         assert!(n < self.g_lagrange.len());
-        self.g.truncate(n);
-        self.g_lagrange = g_to_lagrange(&self.g, new_k);
-        self.g_lagrange_delta = suffix_sum(&self.g_lagrange);
-        self.g_lagrange_double_delta = suffix_sum(&self.g_lagrange_delta);
+        self.g.truncate_into_owned(n);
+        self.g_lagrange = BasesStorage::owned(g_to_lagrange(&self.g, new_k));
+        self.g_lagrange_delta = BasesStorage::owned(suffix_sum(&self.g_lagrange));
+        self.g_lagrange_double_delta = BasesStorage::owned(suffix_sum(&self.g_lagrange_delta));
     }
 
     /// Recompute the Lagrange basis for a smaller circuit domain `new_k` while
@@ -121,9 +122,9 @@ where
             self.g.len() >= n,
             "g is too small to build a Lagrange basis of size 2^{new_k}"
         );
-        self.g_lagrange = g_to_lagrange(&self.g[..n], new_k);
-        self.g_lagrange_delta = suffix_sum(&self.g_lagrange);
-        self.g_lagrange_double_delta = suffix_sum(&self.g_lagrange_delta);
+        self.g_lagrange = BasesStorage::owned(g_to_lagrange(&self.g[..n], new_k));
+        self.g_lagrange_delta = BasesStorage::owned(suffix_sum(&self.g_lagrange));
+        self.g_lagrange_double_delta = BasesStorage::owned(suffix_sum(&self.g_lagrange_delta));
     }
 
     /// Combine the monomial basis from `extended` with the Lagrange basis from
@@ -198,10 +199,10 @@ where
         let s_g2 = g2 * s;
 
         Self {
-            g: g_affine,
-            g_lagrange: g_lagrange_affine,
-            g_lagrange_delta,
-            g_lagrange_double_delta,
+            g: BasesStorage::owned(g_affine),
+            g_lagrange: BasesStorage::owned(g_lagrange_affine),
+            g_lagrange_delta: BasesStorage::owned(g_lagrange_delta),
+            g_lagrange_double_delta: BasesStorage::owned(g_lagrange_double_delta),
             g2,
             s_g2,
         }
@@ -230,10 +231,10 @@ where
         let g_lagrange_delta = suffix_sum(&g_lagrange_affine);
         let g_lagrange_double_delta = suffix_sum(&g_lagrange_delta);
         Self {
-            g: g_affine,
-            g_lagrange: g_lagrange_affine,
-            g_lagrange_delta,
-            g_lagrange_double_delta,
+            g: BasesStorage::owned(g_affine),
+            g_lagrange: BasesStorage::owned(g_lagrange_affine),
+            g_lagrange_delta: BasesStorage::owned(g_lagrange_delta),
+            g_lagrange_double_delta: BasesStorage::owned(g_lagrange_double_delta),
             g2,
             s_g2,
         }
@@ -337,10 +338,10 @@ where
         let g_lagrange_delta = suffix_sum(&g_lagrange);
         let g_lagrange_double_delta = suffix_sum(&g_lagrange_delta);
         Ok(Self {
-            g,
-            g_lagrange,
-            g_lagrange_delta,
-            g_lagrange_double_delta,
+            g: BasesStorage::owned(g),
+            g_lagrange: BasesStorage::owned(g_lagrange),
+            g_lagrange_delta: BasesStorage::owned(g_lagrange_delta),
+            g_lagrange_double_delta: BasesStorage::owned(g_lagrange_double_delta),
             g2,
             s_g2,
         })
