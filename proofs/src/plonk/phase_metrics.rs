@@ -102,12 +102,50 @@ fn sample_rss_hwm_kb() -> Option<(u64, u64)> {
     None
 }
 
+/// Set by the host to ask an in-flight proof to stop.
+///
+/// Cooperative: nothing is interrupted, the request is only observed at the
+/// next phase boundary. A proof that is inside one long phase will not notice
+/// until that phase ends.
+pub static MIDNIGHT_CANCEL: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Prefix on the panic message raised when a cancel is observed.
+///
+/// The host matches on this to tell a requested cancellation apart from a
+/// genuine failure — they arrive through the same channel, so without a marker
+/// a deliberate stop is indistinguishable from a crash.
+pub const MIDNIGHT_CANCEL_SENTINEL: &str = "MIDNIGHT_CANCELLED_BY_HOST";
+
+/// Whether a cancel has been requested.
+pub fn cancel_requested() -> bool {
+    MIDNIGHT_CANCEL.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// The panic message for a cancel observed at `phase`.
+///
+/// Split from the panic itself so it can be tested without setting the global
+/// flag. Setting it in a test would make *every* concurrently running test
+/// that crosses a phase boundary panic, since the tests share a process.
+fn cancel_message(phase: &str) -> String {
+    format!("{MIDNIGHT_CANCEL_SENTINEL}: cancelled at phase {phase}")
+}
+
 /// Emit a phase marker on the `midnight_bench` target.
 ///
 /// Consumed downstream by the wallet's log layer and its live benchmark stage
 /// display. Reports MiB rather than KiB because the interesting magnitudes are
 /// hundreds of MiB and the extra precision is noise.
 pub(crate) fn log_phase(name: &'static str) {
+    // Cancellation is observed here because phase boundaries are the only
+    // points the prover reliably passes through, and they are already
+    // instrumented. Panicking is how the host is told: it unwinds out of the
+    // prover, and the caller matches MIDNIGHT_CANCEL_SENTINEL to distinguish
+    // this from a real failure.
+    if cancel_requested() {
+        panic!("{}", cancel_message(name));
+    }
+
     if let Some((rss_kb, hwm_kb)) = sample_rss_hwm_kb() {
         tracing::info!(
             target: "midnight_bench",
@@ -151,6 +189,27 @@ mod test {
             target_os = "ios"
         )))]
         assert!(sampled.is_none(), "unsupported targets report nothing");
+    }
+
+    #[test]
+    fn cancel_message_carries_the_sentinel_and_the_phase() {
+        // Tested through the message rather than by setting MIDNIGHT_CANCEL:
+        // the flag is process-global, so a test that set it would make every
+        // other concurrently running test panic at its next phase boundary.
+        let m = cancel_message("finalise.compute_h_poly.start");
+        assert!(
+            m.starts_with(MIDNIGHT_CANCEL_SENTINEL),
+            "host matches on this prefix"
+        );
+        assert!(
+            m.contains("finalise.compute_h_poly.start"),
+            "must say which phase"
+        );
+    }
+
+    #[test]
+    fn cancel_is_not_requested_by_default() {
+        assert!(!cancel_requested(), "a proof must not cancel unless asked");
     }
 
     #[test]
