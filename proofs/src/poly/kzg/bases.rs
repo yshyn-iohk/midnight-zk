@@ -46,6 +46,63 @@ use std::sync::Arc;
 use memmap2::Mmap;
 
 /// Storage backing for an SRS basis vector.
+/// View a slice of `C` as its raw bytes, for writing an mmap companion file.
+///
+/// The inverse of what [`BasesStorage::mapped`] reads back, and it lives here
+/// for the same reason: this module is where the crate's `unsafe` budget is
+/// spent, so the cast and the invariant that justifies it stay in one place.
+///
+/// Sound for any `C` — reading the bytes of a live `[C]` is always defined.
+/// The *asymmetry* is that reading them back as `[C]` is only sound under the
+/// layout invariant documented at the top of this module, which is why these
+/// files are a local cache and not an interchange format.
+/// Map `count` values of `C` out of `mmap` starting at byte `offset`.
+///
+/// The checked entry point to [`BasesStorage::Mapped`], and the only one
+/// outside this module. It exists so callers need no `unsafe` of their own:
+/// every precondition `mapped` states is verified here and reported as
+/// `InvalidData` rather than assumed.
+///
+/// - the block lies wholly inside the mapping, with overflow-safe arithmetic
+/// - the block start is aligned for `C`, which is **not** implied by the file
+///   layout: block starts depend on `size_of::<C>()` and need not land on an
+///   `align_of::<C>()` boundary for every `C`
+/// - the `Arc` is cloned in, so the mapping outlives every borrow
+///
+/// What it cannot check is the layout invariant — that the bytes were written
+/// from live `C` on a platform with this representation. That is the caller's,
+/// and is why these files carry a magic and a point-size field.
+pub(crate) fn map_block<C: 'static>(
+    mmap: &Arc<Mmap>,
+    offset: usize,
+    count: usize,
+) -> std::io::Result<BasesStorage<C>> {
+    let bad = |m: &str| std::io::Error::new(std::io::ErrorKind::InvalidData, m.to_string());
+    let size = std::mem::size_of::<C>();
+    let end = count
+        .checked_mul(size)
+        .and_then(|n| offset.checked_add(n))
+        .ok_or_else(|| bad("mmap block: size overflows"))?;
+    if end > mmap.len() {
+        return Err(bad("mmap block: extends past end of file"));
+    }
+    // SAFETY: `offset <= end <= mmap.len()`, so this stays within the mapping.
+    let ptr = unsafe { mmap.as_ptr().add(offset) } as *const C;
+    if !(ptr as usize).is_multiple_of(std::mem::align_of::<C>()) {
+        return Err(bad("mmap block: misaligned for this element type"));
+    }
+    // SAFETY: bounds and alignment checked immediately above; the Arc clone
+    // keeps the mapping alive for as long as the storage, satisfying (4).
+    Ok(unsafe { BasesStorage::mapped(Arc::clone(mmap), ptr, count) })
+}
+
+pub(crate) fn slice_as_bytes<C>(s: &[C]) -> &[u8] {
+    // SAFETY: `s` is a live `[C]`, so `len * size_of::<C>()` bytes from its
+    // start are initialised and owned by it, and `u8` has alignment 1. The
+    // returned borrow carries `s`'s lifetime.
+    unsafe { std::slice::from_raw_parts(s.as_ptr() as *const u8, std::mem::size_of_val(s)) }
+}
+
 pub(crate) enum BasesStorage<C: 'static> {
     /// Heap-allocated. The default for `unsafe_setup`, the eager
     /// `read_custom`, and any `g_to_lagrange` recompute.

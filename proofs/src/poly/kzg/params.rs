@@ -1,6 +1,6 @@
 use std::{fmt::Debug, io};
 
-use crate::poly::kzg::bases::BasesStorage;
+use crate::poly::kzg::bases::{map_block, slice_as_bytes, BasesStorage};
 use ff::{Field, PrimeField};
 use group::{Curve, Group, GroupEncoding, prime::PrimeCurveAffine};
 use midnight_curves::{
@@ -91,6 +91,162 @@ where
                 unimplemented!("KZG does not support extended Lagrange bases")
             }
         }
+    }
+
+
+    /// Write the SRS in the layout [`read_mmap_arc`](Self::read_mmap_arc) expects.
+    ///
+    /// Format **v2**. v1 carried two bases; upstream's `ParamsKZG` now holds four
+    /// — `g`, `g_lagrange`, and the two suffix-sum bases — so the layout gained
+    /// two more blocks and the magic changed to refuse v1 files rather than
+    /// silently misread them.
+    ///
+    /// ```text
+    /// 0    "MDNGHTV2"  magic
+    /// 8    u32         version = 2
+    /// 12   u32         k
+    /// 16   u32         size_of::<E::G1Affine>()
+    /// 20   u32         flags (bit 0: all four bases present)
+    /// 24   [u8; 8]     reserved
+    /// 32   4 x (u64 offset, u64 count)   g, g_lagrange, delta, double_delta
+    /// 96   u64 g2_offset, u64 g2_size, u64 s_g2_offset, u64 s_g2_size
+    /// 256  basis blocks, then g2, then s_g2
+    /// ```
+    ///
+    /// Blocks start at 256 for SIMD-friendly alignment, which also leaves room
+    /// to grow the header again without moving the data.
+    ///
+    /// The basis blocks are the raw in-memory bytes of consecutive
+    /// `E::G1Affine`. That is only sound to read back on a platform with the
+    /// same representation — see the layout invariant on
+    /// [`BasesStorage`](crate::poly::kzg::bases::BasesStorage). These files are
+    /// a local cache, not an interchange format.
+    pub fn write_mmap_companion<W: io::Write>(&self, writer: &mut W) -> io::Result<()>
+    where
+        E::G2: ProcessedSerdeObject,
+    {
+        const HEADER_LEN: usize = 128;
+        const BLOCK_OFFSET: u64 = 256;
+
+        let point_size = std::mem::size_of::<E::G1Affine>() as u64;
+        let k = (self.g.len() as u64).ilog2();
+
+        let bases: [&[E::G1Affine]; 4] = [
+            &self.g,
+            &self.g_lagrange,
+            &self.g_lagrange_delta,
+            &self.g_lagrange_double_delta,
+        ];
+
+        // Lay the four blocks out back to back from BLOCK_OFFSET.
+        let mut offsets = [0u64; 4];
+        let mut counts = [0u64; 4];
+        let mut cursor = BLOCK_OFFSET;
+        for (i, b) in bases.iter().enumerate() {
+            offsets[i] = cursor;
+            counts[i] = b.len() as u64;
+            cursor += b.len() as u64 * point_size;
+        }
+
+        // g2 / s_g2 are small and serialised, not mapped.
+        let mut g2_buf = Vec::new();
+        self.g2.write(&mut g2_buf, SerdeFormat::RawBytesUnchecked)?;
+        let mut s_g2_buf = Vec::new();
+        self.s_g2.write(&mut s_g2_buf, SerdeFormat::RawBytesUnchecked)?;
+        let g2_offset = cursor;
+        let s_g2_offset = g2_offset + g2_buf.len() as u64;
+
+        writer.write_all(b"MDNGHTV2")?;
+        writer.write_all(&2u32.to_le_bytes())?;
+        writer.write_all(&k.to_le_bytes())?;
+        writer.write_all(&(point_size as u32).to_le_bytes())?;
+        writer.write_all(&1u32.to_le_bytes())?;
+        writer.write_all(&[0u8; 8])?;
+        for i in 0..4 {
+            writer.write_all(&offsets[i].to_le_bytes())?;
+            writer.write_all(&counts[i].to_le_bytes())?;
+        }
+        writer.write_all(&g2_offset.to_le_bytes())?;
+        writer.write_all(&(g2_buf.len() as u64).to_le_bytes())?;
+        writer.write_all(&s_g2_offset.to_le_bytes())?;
+        writer.write_all(&(s_g2_buf.len() as u64).to_le_bytes())?;
+        writer.write_all(&vec![0u8; BLOCK_OFFSET as usize - HEADER_LEN])?;
+
+        for b in bases.iter() {
+            writer.write_all(slice_as_bytes(b))?;
+        }
+        writer.write_all(&g2_buf)?;
+        writer.write_all(&s_g2_buf)?;
+        Ok(())
+    }
+
+
+    /// Construct `ParamsKZG` whose four bases are slice views over a
+    /// memory-mapped companion file written by
+    /// [`write_mmap_companion`](Self::write_mmap_companion).
+    ///
+    /// The point of the exercise: at k=20 the four bases are the bulk of the
+    /// SRS heap, and mapping them moves that cost from resident memory to page
+    /// cache the OS can reclaim under pressure. On a phone that is the
+    /// difference between a peak the kernel tolerates and one it does not.
+    ///
+    /// Returns `InvalidData` rather than panicking on a file that is not ours,
+    /// is a different format version, was written on a platform with a
+    /// different point representation, is truncated, or whose blocks are not
+    /// correctly aligned for `E::G1Affine`. Those are all reachable by handing
+    /// it an arbitrary file, so none of them may be an `unwrap`.
+    pub fn read_mmap_arc(mmap: std::sync::Arc<memmap2::Mmap>) -> io::Result<Self>
+    where
+        E::G2: ProcessedSerdeObject,
+    {
+        const HEADER_LEN: usize = 128;
+        let bytes: &[u8] = &mmap[..];
+        let bad = |m: &str| io::Error::new(io::ErrorKind::InvalidData, m.to_string());
+
+        if bytes.len() < HEADER_LEN {
+            return Err(bad("mmap companion: shorter than its header"));
+        }
+        if &bytes[0..8] != b"MDNGHTV2" {
+            return Err(bad("mmap companion: bad magic (v1 files are not readable)"));
+        }
+        let rd32 = |o: usize| u32::from_le_bytes(bytes[o..o + 4].try_into().unwrap());
+        let rd64 = |o: usize| u64::from_le_bytes(bytes[o..o + 8].try_into().unwrap());
+
+        if rd32(8) != 2 {
+            return Err(bad("mmap companion: unsupported format version"));
+        }
+        let point_size = rd32(16) as usize;
+        if point_size != std::mem::size_of::<E::G1Affine>() {
+            return Err(bad("mmap companion: point size differs from this build"));
+        }
+
+        let mut bases: Vec<BasesStorage<E::G1Affine>> = Vec::with_capacity(4);
+        for i in 0..4 {
+            let off = rd64(32 + i * 16) as usize;
+            let count = rd64(32 + i * 16 + 8) as usize;
+            bases.push(map_block::<E::G1Affine>(&mmap, off, count)?);
+        }
+
+        let g2_off = rd64(96) as usize;
+        let g2_size = rd64(104) as usize;
+        let s_g2_off = rd64(112) as usize;
+        let s_g2_size = rd64(120) as usize;
+        if g2_off + g2_size > bytes.len() || s_g2_off + s_g2_size > bytes.len() {
+            return Err(bad("mmap companion: g2 block extends past end of file"));
+        }
+        let g2 = E::G2::read(&mut &bytes[g2_off..g2_off + g2_size], SerdeFormat::RawBytesUnchecked)?;
+        let s_g2 =
+            E::G2::read(&mut &bytes[s_g2_off..s_g2_off + s_g2_size], SerdeFormat::RawBytesUnchecked)?;
+
+        let mut it = bases.into_iter();
+        Ok(ParamsKZG {
+            g: it.next().unwrap(),
+            g_lagrange: it.next().unwrap(),
+            g_lagrange_delta: it.next().unwrap(),
+            g_lagrange_double_delta: it.next().unwrap(),
+            g2,
+            s_g2,
+        })
     }
 
     /// Downsize the current parameters to match a smaller `k`.
@@ -543,5 +699,82 @@ mod test {
         assert_eq!(params0.g_lagrange, params1.g_lagrange);
         assert_eq!(params0.g2, params1.g2);
         assert_eq!(params0.s_g2, params1.s_g2);
+    }
+
+    #[test]
+    // `Mmap::map` is unsafe by design: the mapping is UB if the file is mutated
+    // externally while live. Wrapping it in a "safe" helper would launder that,
+    // so it is allowed here instead, where the file is test-local and untouched.
+    #[allow(unsafe_code)]
+    fn mmap_companion_round_trips_all_four_bases() {
+        use midnight_curves::Bls12;
+        let params = ParamsKZG::<Bls12>::unsafe_setup(4, OsRng);
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("srs.mmap");
+        {
+            let mut f = std::fs::File::create(&path).unwrap();
+            params.write_mmap_companion(&mut f).unwrap();
+        }
+
+        let file = std::fs::File::open(&path).unwrap();
+        // SAFETY: test-local file, not mutated while mapped.
+        let mmap = unsafe { memmap2::Mmap::map(&file) }.unwrap();
+        let mapped = ParamsKZG::<Bls12>::read_mmap_arc(std::sync::Arc::new(mmap)).unwrap();
+
+        // All four bases must survive, not just the two the original patch carried.
+        assert_eq!(&*mapped.g, &*params.g, "g");
+        assert_eq!(&*mapped.g_lagrange, &*params.g_lagrange, "g_lagrange");
+        assert_eq!(&*mapped.g_lagrange_delta, &*params.g_lagrange_delta, "delta");
+        assert_eq!(
+            &*mapped.g_lagrange_double_delta, &*params.g_lagrange_double_delta,
+            "double_delta"
+        );
+        assert_eq!(mapped.g2, params.g2);
+        assert_eq!(mapped.s_g2, params.s_g2);
+    }
+
+    #[test]
+    // `Mmap::map` is unsafe by design: the mapping is UB if the file is mutated
+    // externally while live. Wrapping it in a "safe" helper would launder that,
+    // so it is allowed here instead, where the file is test-local and untouched.
+    #[allow(unsafe_code)]
+    fn mmap_companion_rejects_bad_input_instead_of_panicking() {
+        use midnight_curves::Bls12;
+        let params = ParamsKZG::<Bls12>::unsafe_setup(4, OsRng);
+        let mut good = Vec::new();
+        params.write_mmap_companion(&mut good).unwrap();
+
+        let load = |bytes: Vec<u8>| {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("f");
+            std::fs::write(&path, &bytes).unwrap();
+            let f = std::fs::File::open(&path).unwrap();
+            let m = unsafe { memmap2::Mmap::map(&f) }.unwrap();
+            ParamsKZG::<Bls12>::read_mmap_arc(std::sync::Arc::new(m))
+        };
+
+        // Each of these is reachable by handing the loader an arbitrary file,
+        // so each must be an error rather than a panic or a wrong read.
+        assert!(load(vec![0u8; 16]).is_err(), "too short for a header");
+
+        let mut wrong_magic = good.clone();
+        wrong_magic[0..8].copy_from_slice(b"MDNGHTV1");
+        assert!(load(wrong_magic).is_err(), "v1 magic must be refused, not misread");
+
+        let mut wrong_version = good.clone();
+        wrong_version[8..12].copy_from_slice(&99u32.to_le_bytes());
+        assert!(load(wrong_version).is_err(), "unknown version");
+
+        let mut wrong_point = good.clone();
+        wrong_point[16..20].copy_from_slice(&7u32.to_le_bytes());
+        assert!(load(wrong_point).is_err(), "point size from another platform");
+
+        let truncated = good[..good.len() / 2].to_vec();
+        assert!(load(truncated).is_err(), "block past end of file");
+
+        let mut huge_count = good.clone();
+        huge_count[40..48].copy_from_slice(&u64::MAX.to_le_bytes());
+        assert!(load(huge_count).is_err(), "count that overflows on multiply");
     }
 }
