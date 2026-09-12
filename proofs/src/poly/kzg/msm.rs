@@ -168,6 +168,32 @@ where
     }
 }
 
+/// Largest MSM that stays on the blstrs fast path.
+///
+/// Architecture-dependent, and deliberately so. blstrs's hand-tuned Pippenger
+/// plus its threadpool beat the generic `msm_best` up to a point that differs
+/// by target:
+///
+/// - **aarch64** (Apple M-series, A17/A18): still winning well past 2^20, so
+///   the gate sits at 2^21 and k=21 (n = 1 048 576) stays on the fast path.
+/// - **everything else**: the original gate, empirically tuned on x86 where
+///   blstrs regresses past roughly 5·10^5 scalars.
+///
+/// Mailbox `0005` raised this unconditionally, which suits a fork targeting
+/// phones but would regress x86 — including the proof server, where MSMs of
+/// this size are routine. Gating on the architecture keeps the aarch64 win
+/// without paying for it elsewhere.
+///
+/// Note the original expression was `2 << 18`, which is 2^19 rather than the
+/// 2^18 its comment claimed. Preserved as `1 << 19` to keep behaviour
+/// identical while saying what it means.
+#[cfg(target_arch = "aarch64")]
+const BLSTRS_FASTPATH_MAX: usize = 1 << 21;
+
+/// See [`BLSTRS_FASTPATH_MAX`] on aarch64 for why this differs by target.
+#[cfg(not(target_arch = "aarch64"))]
+const BLSTRS_FASTPATH_MAX: usize = 1 << 19;
+
 #[allow(unsafe_code)]
 /// Wrapper over the MSM function to use the blstrs underlying function.
 /// Bases are passed as affine points.
@@ -187,7 +213,7 @@ pub fn msm_specific<C: CurveAffine>(coeffs: &[C::Scalar], bases: &[C]) -> C::Cur
     // NOTE: Empirically checked that for MSMs larger than 2**18, the blstrs
     // implementation regresses.
     // TODO: Review this threshold after optimizations.
-    if coeffs.len() <= (2 << 18) && TypeId::of::<C>() == TypeId::of::<G1Affine>() {
+    if coeffs.len() <= BLSTRS_FASTPATH_MAX && TypeId::of::<C>() == TypeId::of::<G1Affine>() {
         // Safe: we just checked the type.
         let coeffs = unsafe { &*(coeffs.as_slice() as *const _ as *const [Fq]) };
         let bases = unsafe { &*(bases.as_slice() as *const _ as *const [G1Affine]) };
