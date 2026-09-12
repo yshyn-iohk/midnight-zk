@@ -32,6 +32,60 @@ jobs:
           curl -L -o zk_stdlib/examples/assets/bls_filecoin_2p19 \
             https://midnight-s3-fileshare-dev-eu-west-1.s3.eu-west-1.amazonaws.com/bls_filecoin_2p19
 
+  feature-matrix:
+    if: github.event.pull_request.draft == false
+    name: Feature matrix (${{ matrix.name }})
+    runs-on: ubuntu-latest
+
+    # The host-only optimisations are off by default so wasm consumers neither
+    # ship memmap2/tempfile nor can reach paths that need a filesystem. Each
+    # combination is built and tested on its own: a feature that only ever
+    # compiles alongside another is a feature whose own arm is untested.
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: default
+            args: ""
+          - name: mmap
+            args: "--features mmap"
+          - name: disk-spill
+            args: "--features disk-spill"
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      - uses: ./.github/actions/cargo-test
+        with:
+          package: midnight-proofs
+          args: --lib ${{ matrix.args }}
+
+  wasm-build:
+    if: github.event.pull_request.draft == false
+    name: Build for wasm32
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      - run: rustup target add wasm32-unknown-unknown
+
+      # Default features must build for wasm - the browser wallet is a
+      # first-class consumer, and blst needs an LLVM clang with a wasm backend
+      # to compile its C sources.
+      - name: Build with default features
+        run: cargo build -p midnight-proofs --lib --target wasm32-unknown-unknown
+
+      # And a host-only feature on wasm must fail loudly at build time rather
+      # than at runtime in someone's browser. This asserts the compile_error
+      # fires; if it ever stops, the guard has silently stopped guarding.
+      - name: A host-only feature on wasm must refuse to build
+        run: |
+          if cargo check -p midnight-proofs --lib --features mmap \
+               --target wasm32-unknown-unknown 2>/dev/null; then
+            echo "::error::--features mmap built for wasm32; the compile_error guard is not firing"
+            exit 1
+          fi
+          echo "guard fired as expected"
+
   test-blstrs:
     if: github.event.pull_request.draft == false
     name: Test blstrs
