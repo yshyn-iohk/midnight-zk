@@ -168,6 +168,26 @@ where
     }
 }
 
+/// Chunk size for the generic MSM fallback, as a log2 base count.
+///
+/// `msm_best` allocates internally in proportion to the number of bases it is
+/// handed, and that allocation is not ours to shrink — it lives in another
+/// crate. Feeding it bounded chunks bounds the allocation instead: at the
+/// default 2^18 bases a chunk is a few tens of MiB regardless of how large the
+/// whole MSM is.
+///
+/// Sound because multi-scalar multiplication is linear — the sum of partial
+/// MSMs over a partition equals the MSM of the whole, exactly, since group
+/// addition is associative and commutative with no rounding to accumulate.
+fn msm_chunk_size() -> usize {
+    const DEFAULT_CHUNK_LOG2: u32 = 18;
+    let log2 = std::env::var("MIDNIGHT_MSM_CHUNK_LOG2")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(DEFAULT_CHUNK_LOG2);
+    1usize << log2
+}
+
 /// Largest MSM that stays on the blstrs fast path.
 ///
 /// Architecture-dependent, and deliberately so. blstrs's hand-tuned Pippenger
@@ -222,7 +242,18 @@ pub fn msm_specific<C: CurveAffine>(coeffs: &[C::Scalar], bases: &[C]) -> C::Cur
         let res = G1Affine::multi_exp_affine(bases, coeffs);
         unsafe { std::mem::transmute_copy(&res) }
     } else {
-        msm_best(&coeffs, &bases)
+        // Past the fast path, run `msm_best` over bounded chunks and sum the
+        // partial results rather than handing it the whole MSM at once. See
+        // `msm_chunk_size` for why this is exact.
+        let chunk = msm_chunk_size();
+        if coeffs.len() <= chunk {
+            return msm_best(&coeffs, &bases);
+        }
+        coeffs
+            .chunks(chunk)
+            .zip(bases.chunks(chunk))
+            .map(|(c, b)| msm_best(c, b))
+            .fold(C::Curve::identity(), |acc, p| acc + p)
     }
 }
 
@@ -333,5 +364,47 @@ where
         let terms = &[term_1, term_2];
 
         bool::from(E::multi_miller_loop(&terms[..]).final_exponentiation().is_identity())
+    }
+}
+
+#[cfg(test)]
+mod chunked_msm_test {
+    use ff::Field;
+    use group::Group;
+    use midnight_curves::{Fq as Fp, G1Affine, G1Projective};
+    use rand_core::OsRng;
+
+    use super::*;
+
+    #[test]
+    fn chunked_fallback_equals_unchunked() {
+        // The property the optimisation rests on: MSM is linear, so summing
+        // partial MSMs over a partition gives exactly the whole. Group
+        // addition is exact, so this is equality and not approximation - if it
+        // ever fails, the optimisation is silently producing wrong proofs.
+        let n = 1000usize;
+        let coeffs: Vec<Fp> = (0..n).map(|_| Fp::random(OsRng)).collect();
+        let bases: Vec<G1Affine> = (0..n).map(|_| G1Projective::random(OsRng).into()).collect();
+
+        let whole = msm_best(&coeffs, &bases);
+
+        for chunk in [1usize, 7, 128, 999, 1000, 4096] {
+            let summed = coeffs
+                .chunks(chunk)
+                .zip(bases.chunks(chunk))
+                .map(|(c, b)| msm_best(c, b))
+                .fold(G1Projective::identity(), |acc, p| acc + p);
+            assert_eq!(whole, summed, "chunk size {chunk} changed the MSM result");
+        }
+    }
+
+    #[test]
+    fn chunk_size_defaults_and_is_a_power_of_two() {
+        let c = msm_chunk_size();
+        assert!(c.is_power_of_two(), "chunk size must be a power of two");
+        assert!(
+            c >= 1 << 10,
+            "a tiny chunk would make the fallback quadratic in call count"
+        );
     }
 }
