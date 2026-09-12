@@ -34,6 +34,8 @@ pub(crate) mod logup;
 /// Memory-mapped spill for batches of polynomials.
 pub mod mmap_pk;
 pub mod permutation;
+/// Per-phase memory instrumentation for the prover and keygen.
+pub(crate) mod phase_metrics;
 pub(crate) mod traces;
 pub(crate) mod trash;
 

@@ -20,6 +20,7 @@ use super::{
         Selector,
     },
     logup, permutation,
+    phase_metrics::log_phase,
 };
 use crate::{
     circuit::Value,
@@ -103,9 +104,13 @@ where
 
     let domain = &pk.vk.domain;
 
+    log_phase("trace.compute_instances.start");
     let instance = compute_instances(params, pk, instances, nb_committed_instances, transcript)?;
+    log_phase("trace.compute_instances.end");
 
+    log_phase("trace.parse_advices.start");
     let advice = parse_advices(params, pk, circuit, instances, transcript, &mut rng)?;
+    log_phase("trace.parse_advices.end");
 
     // Helper: sample `num_sets` blinding vectors, each of length `inner_len`.
     // Used to pre-generate every blinding the parallel compute sections below
@@ -125,6 +130,7 @@ where
 
     // Commit to the multiplicities columns.
     // Computation in parallel, then sequential transcript writes.
+    log_phase("trace.lookups_permuted.start");
     let lookups: Vec<logup::prover::ComputedMultiplicities<F>> = {
         let logup_args: Vec<_> =
             pk.vk.cs.lookups.iter().map(|l| l.chunk_by_degree(pk.vk.cs.degree())).collect();
@@ -155,6 +161,7 @@ where
             })
             .collect::<Result<Vec<_>, Error>>()?
     };
+    log_phase("trace.lookups_permuted.end");
 
     // Sample beta challenge
     let beta: F = transcript.squeeze_challenge();
@@ -709,7 +716,9 @@ where
     CS::Commitment: Hashable<T::Hash>,
 {
     // Construct quotient polynomial h(X) = nu(X) / (X^n - 1) in evaluation form
+    log_phase("finalise.compute_h_poly.start");
     let h_poly = domain.divide_by_vanishing_poly(nu_poly);
+    log_phase("finalise.compute_h_poly.end");
 
     // Convert h(X) to coefficient form
     let mut h_poly = domain.extended_to_coeff(h_poly);
