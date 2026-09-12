@@ -13,6 +13,7 @@ use rayon::iter::{
     IndexedParallelIterator, IntoParallelIterator, IntoParallelRefIterator, ParallelIterator,
 };
 
+use super::mmap_pk::build_cosets;
 use super::{
     Error, ProvingKey,
     circuit::{
@@ -652,15 +653,32 @@ pub(super) fn compute_nu_poly<F: WithSmallOrderMulGroup<3>, CS: PolynomialCommit
         y,
         ..
     } = &trace;
-    // Calculate the advice and instance cosets
-    let advice_cosets: Vec<Polynomial<F, ExtendedLagrangeCoeff>> = advice_polys
-        .par_iter()
-        .map(|poly| pk.vk.get_domain().coeff_to_extended(poly.clone()))
-        .collect();
-    let instance_cosets: Vec<Polynomial<F, ExtendedLagrangeCoeff>> = instance_polys
-        .par_iter()
-        .map(|poly| pk.vk.get_domain().coeff_to_extended(poly.clone()))
-        .collect();
+    // Calculate the advice and instance cosets. `build_cosets` spills them to a
+    // mapped tempfile when MIDNIGHT_SPILL_COSETS is set and k is at or above
+    // the floor; otherwise it is the parallel heap collect this always was.
+    let k = pk.vk.get_domain().k();
+    let advice_cosets = build_cosets(advice_polys, k, |p| {
+        pk.vk.get_domain().coeff_to_extended(p.clone())
+    });
+    let instance_cosets = build_cosets(instance_polys, k, |p| {
+        pk.vk.get_domain().coeff_to_extended(p.clone())
+    });
+
+    // `fixed_cosets` normally arrives materialised on the ProvingKey. When it
+    // does not - a key built or deserialised without them - rebuild from
+    // `fixed_polys`, spilling under the same conditions rather than forcing a
+    // full heap materialisation at the point we are trying to save memory.
+    let rebuilt_fixed_cosets = if pk.fixed_cosets.is_empty() {
+        Some(build_cosets(&pk.fixed_polys, k, |p| {
+            pk.vk.get_domain().coeff_to_extended(p.clone())
+        }))
+    } else {
+        None
+    };
+    let fixed_cosets: &[Polynomial<F, ExtendedLagrangeCoeff>] = match &rebuilt_fixed_cosets {
+        Some(c) => c.as_slice(),
+        None => &pk.fixed_cosets,
+    };
 
     // Evaluate the numerator polynomial nu(X) of the quotient polynomial
     // h(X) = nu(X) / (X^n-1): nu(X) is a random linear combination of all
@@ -668,9 +686,9 @@ pub(super) fn compute_nu_poly<F: WithSmallOrderMulGroup<3>, CS: PolynomialCommit
     pk.ev.evaluate_numerator::<ExtendedLagrangeCoeff>(
         &pk.vk.domain,
         &pk.vk.cs,
-        &advice_cosets,
-        &instance_cosets,
-        &pk.fixed_cosets,
+        advice_cosets.as_slice(),
+        instance_cosets.as_slice(),
+        fixed_cosets,
         *y,
         *beta,
         *gamma,
