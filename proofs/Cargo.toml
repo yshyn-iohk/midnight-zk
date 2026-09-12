@@ -49,14 +49,15 @@ rustc-hash = "2"
 # letting the OS evict cold pages under pressure. No feature flag - the
 # crate compiles and works without anyone calling the mmap path.
 memmap2 = "0.9"
+# Spill target for MmappedPolys: polynomials are streamed to a tempfile and
+# mapped back, so the file is a runtime dependency rather than a test one.
+tempfile = "3"
 
 # Developer tooling dependencies
 tabbycat = { version = "0.1", features = ["attributes"], optional = true }
 num-bigint = { workspace = true }
 
 [dev-dependencies]
-# Round-trip tests for write_mmap_companion / read_mmap_arc.
-tempfile = "3"
 assert_matches = "1.5"
 proptest = "1"
 serde_json = { workspace = true }

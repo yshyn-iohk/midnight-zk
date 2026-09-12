@@ -31,6 +31,8 @@ pub(crate) mod evaluation;
 mod keygen;
 pub(crate) mod linearization;
 pub(crate) mod logup;
+/// Memory-mapped spill for batches of polynomials.
+pub mod mmap_pk;
 pub mod permutation;
 pub(crate) mod traces;
 pub(crate) mod trash;
