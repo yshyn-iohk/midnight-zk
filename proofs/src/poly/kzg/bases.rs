@@ -41,8 +41,10 @@
 #![allow(unsafe_code)]
 
 use std::ops::Deref;
+#[cfg(feature = "mmap")]
 use std::sync::Arc;
 
+#[cfg(feature = "mmap")]
 use memmap2::Mmap;
 
 /// Storage backing for an SRS basis vector.
@@ -72,6 +74,7 @@ use memmap2::Mmap;
 /// What it cannot check is the layout invariant — that the bytes were written
 /// from live `C` on a platform with this representation. That is the caller's,
 /// and is why these files carry a magic and a point-size field.
+#[cfg(feature = "mmap")]
 pub(crate) fn map_block<C: 'static>(
     mmap: &Arc<Mmap>,
     offset: usize,
@@ -96,6 +99,7 @@ pub(crate) fn map_block<C: 'static>(
     Ok(unsafe { BasesStorage::mapped(Arc::clone(mmap), ptr, count) })
 }
 
+#[cfg(feature = "mmap")]
 pub(crate) fn slice_as_bytes<C>(s: &[C]) -> &[u8] {
     // SAFETY: `s` is a live `[C]`, so `len * size_of::<C>()` bytes from its
     // start are initialised and owned by it, and `u8` has alignment 1. The
@@ -107,6 +111,7 @@ pub(crate) enum BasesStorage<C: 'static> {
     /// Heap-allocated. The default for `unsafe_setup`, the eager
     /// `read_custom`, and any `g_to_lagrange` recompute.
     Owned(Vec<C>),
+    #[cfg(feature = "mmap")]
     /// Slice view into a memory-mapped file. The `Arc<Mmap>` keeps
     /// the mapping alive for the lifetime of this value.
     Mapped {
@@ -149,6 +154,7 @@ impl<C: 'static> BasesStorage<C> {
     ///    in-memory representation we're now claiming.
     /// 4. The `Arc<Mmap>` lives at least as long as any borrow
     ///    obtained through `Deref`.
+    #[cfg(feature = "mmap")]
     pub(crate) unsafe fn mapped(mmap: Arc<Mmap>, ptr: *const C, len: usize) -> Self {
         BasesStorage::Mapped {
             _mmap: mmap,
@@ -161,7 +167,15 @@ impl<C: 'static> BasesStorage<C> {
     /// Used by `downsize` to refuse in-place mutation.
     #[allow(dead_code)] // used once downsize is implemented for mapped
     pub(crate) fn is_mapped(&self) -> bool {
-        matches!(self, BasesStorage::Mapped { .. })
+        #[cfg(feature = "mmap")]
+        {
+            matches!(self, BasesStorage::Mapped { .. })
+        }
+        // Without the `mmap` feature there is no mapped variant to be.
+        #[cfg(not(feature = "mmap"))]
+        {
+            false
+        }
     }
 
     /// Truncate to `n` elements, allocating-copying out of an mmap
@@ -174,6 +188,7 @@ impl<C: 'static> BasesStorage<C> {
     {
         match self {
             BasesStorage::Owned(v) => v.truncate(n),
+            #[cfg(feature = "mmap")]
             BasesStorage::Mapped { .. } => {
                 let copy: Vec<C> = self.deref()[..n].to_vec();
                 *self = BasesStorage::Owned(copy);
@@ -189,6 +204,7 @@ impl<C: 'static> Deref for BasesStorage<C> {
             BasesStorage::Owned(v) => v.as_slice(),
             // SAFETY: documented invariants in `mapped()` plus
             // `_mmap` keeps the region alive for our lifetime.
+            #[cfg(feature = "mmap")]
             BasesStorage::Mapped { ptr, len, .. } => unsafe {
                 std::slice::from_raw_parts(*ptr, *len)
             },
@@ -202,6 +218,7 @@ impl<C: Clone + 'static> Clone for BasesStorage<C> {
             BasesStorage::Owned(v) => BasesStorage::Owned(v.clone()),
             // Cloning a Mapped is a refcount bump on the Arc plus
             // pointer copy — same backing region, no allocation.
+            #[cfg(feature = "mmap")]
             BasesStorage::Mapped { _mmap, ptr, len } => BasesStorage::Mapped {
                 _mmap: Arc::clone(_mmap),
                 ptr: *ptr,
@@ -215,6 +232,7 @@ impl<C: std::fmt::Debug + 'static> std::fmt::Debug for BasesStorage<C> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let kind = match self {
             BasesStorage::Owned(_) => "Owned",
+            #[cfg(feature = "mmap")]
             BasesStorage::Mapped { .. } => "Mapped",
         };
         f.debug_struct("BasesStorage")

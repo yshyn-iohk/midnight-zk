@@ -26,12 +26,15 @@ use crate::{
 
 pub(crate) mod argument;
 mod circuit;
+/// Coset construction, spilling to disk when built to.
+pub mod cosets;
 mod error;
 pub(crate) mod evaluation;
 mod keygen;
 pub(crate) mod linearization;
 pub(crate) mod logup;
 /// Memory-mapped spill for batches of polynomials.
+#[cfg(feature = "disk-spill")]
 pub mod mmap_pk;
 pub mod permutation;
 /// Per-phase memory instrumentation for the prover and keygen.

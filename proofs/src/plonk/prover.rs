@@ -13,7 +13,7 @@ use rayon::iter::{
     IndexedParallelIterator, IntoParallelIterator, IntoParallelRefIterator, ParallelIterator,
 };
 
-use super::mmap_pk::build_cosets;
+use super::cosets::build_cosets;
 use super::{
     Error, ProvingKey,
     circuit::{

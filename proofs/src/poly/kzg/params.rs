@@ -1,6 +1,8 @@
 use std::{fmt::Debug, io};
 
-use crate::poly::kzg::bases::{map_block, slice_as_bytes, BasesStorage};
+use crate::poly::kzg::bases::BasesStorage;
+#[cfg(feature = "mmap")]
+use crate::poly::kzg::bases::{map_block, slice_as_bytes};
 use ff::{Field, PrimeField};
 use group::{Curve, Group, GroupEncoding, prime::PrimeCurveAffine};
 use midnight_curves::{
@@ -93,7 +95,6 @@ where
         }
     }
 
-
     /// Write the SRS in the layout [`read_mmap_arc`](Self::read_mmap_arc) expects.
     ///
     /// Format **v2**. v1 carried two bases; upstream's `ParamsKZG` now holds four
@@ -121,6 +122,7 @@ where
     /// same representation — see the layout invariant on
     /// [`BasesStorage`](crate::poly::kzg::bases::BasesStorage). These files are
     /// a local cache, not an interchange format.
+    #[cfg(feature = "mmap")]
     pub fn write_mmap_companion<W: io::Write>(&self, writer: &mut W) -> io::Result<()>
     where
         E::G2: ProcessedSerdeObject,
@@ -180,7 +182,6 @@ where
         Ok(())
     }
 
-
     /// Construct `ParamsKZG` whose four bases are slice views over a
     /// memory-mapped companion file written by
     /// [`write_mmap_companion`](Self::write_mmap_companion).
@@ -195,6 +196,7 @@ where
     /// different point representation, is truncated, or whose blocks are not
     /// correctly aligned for `E::G1Affine`. Those are all reachable by handing
     /// it an arbitrary file, so none of them may be an `unwrap`.
+    #[cfg(feature = "mmap")]
     pub fn read_mmap_arc(mmap: std::sync::Arc<memmap2::Mmap>) -> io::Result<Self>
     where
         E::G2: ProcessedSerdeObject,
@@ -234,9 +236,14 @@ where
         if g2_off + g2_size > bytes.len() || s_g2_off + s_g2_size > bytes.len() {
             return Err(bad("mmap companion: g2 block extends past end of file"));
         }
-        let g2 = E::G2::read(&mut &bytes[g2_off..g2_off + g2_size], SerdeFormat::RawBytesUnchecked)?;
-        let s_g2 =
-            E::G2::read(&mut &bytes[s_g2_off..s_g2_off + s_g2_size], SerdeFormat::RawBytesUnchecked)?;
+        let g2 = E::G2::read(
+            &mut &bytes[g2_off..g2_off + g2_size],
+            SerdeFormat::RawBytesUnchecked,
+        )?;
+        let s_g2 = E::G2::read(
+            &mut &bytes[s_g2_off..s_g2_off + s_g2_size],
+            SerdeFormat::RawBytesUnchecked,
+        )?;
 
         let mut it = bases.into_iter();
         Ok(ParamsKZG {
@@ -706,6 +713,7 @@ mod test {
     // externally while live. Wrapping it in a "safe" helper would launder that,
     // so it is allowed here instead, where the file is test-local and untouched.
     #[allow(unsafe_code)]
+    #[cfg(feature = "mmap")]
     fn mmap_companion_round_trips_all_four_bases() {
         use midnight_curves::Bls12;
         let params = ParamsKZG::<Bls12>::unsafe_setup(4, OsRng);
@@ -725,7 +733,10 @@ mod test {
         // All four bases must survive, not just the two the original patch carried.
         assert_eq!(&*mapped.g, &*params.g, "g");
         assert_eq!(&*mapped.g_lagrange, &*params.g_lagrange, "g_lagrange");
-        assert_eq!(&*mapped.g_lagrange_delta, &*params.g_lagrange_delta, "delta");
+        assert_eq!(
+            &*mapped.g_lagrange_delta, &*params.g_lagrange_delta,
+            "delta"
+        );
         assert_eq!(
             &*mapped.g_lagrange_double_delta, &*params.g_lagrange_double_delta,
             "double_delta"
@@ -739,6 +750,7 @@ mod test {
     // externally while live. Wrapping it in a "safe" helper would launder that,
     // so it is allowed here instead, where the file is test-local and untouched.
     #[allow(unsafe_code)]
+    #[cfg(feature = "mmap")]
     fn mmap_companion_rejects_bad_input_instead_of_panicking() {
         use midnight_curves::Bls12;
         let params = ParamsKZG::<Bls12>::unsafe_setup(4, OsRng);
@@ -760,7 +772,10 @@ mod test {
 
         let mut wrong_magic = good.clone();
         wrong_magic[0..8].copy_from_slice(b"MDNGHTV1");
-        assert!(load(wrong_magic).is_err(), "v1 magic must be refused, not misread");
+        assert!(
+            load(wrong_magic).is_err(),
+            "v1 magic must be refused, not misread"
+        );
 
         let mut wrong_version = good.clone();
         wrong_version[8..12].copy_from_slice(&99u32.to_le_bytes());
@@ -768,13 +783,19 @@ mod test {
 
         let mut wrong_point = good.clone();
         wrong_point[16..20].copy_from_slice(&7u32.to_le_bytes());
-        assert!(load(wrong_point).is_err(), "point size from another platform");
+        assert!(
+            load(wrong_point).is_err(),
+            "point size from another platform"
+        );
 
         let truncated = good[..good.len() / 2].to_vec();
         assert!(load(truncated).is_err(), "block past end of file");
 
         let mut huge_count = good.clone();
         huge_count[40..48].copy_from_slice(&u64::MAX.to_le_bytes());
-        assert!(load(huge_count).is_err(), "count that overflows on multiply");
+        assert!(
+            load(huge_count).is_err(),
+            "count that overflows on multiply"
+        );
     }
 }

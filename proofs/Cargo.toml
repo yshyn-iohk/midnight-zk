@@ -48,16 +48,18 @@ rustc-hash = "2"
 # instead of heap Vecs, saving ~144 MiB per materialised basis at k=20 and
 # letting the OS evict cold pages under pressure. No feature flag - the
 # crate compiles and works without anyone calling the mmap path.
-memmap2 = "0.9"
+memmap2 = { version = "0.9", optional = true }
 # Spill target for MmappedPolys: polynomials are streamed to a tempfile and
 # mapped back, so the file is a runtime dependency rather than a test one.
-tempfile = "3"
+tempfile = { version = "3", optional = true }
 
 # Developer tooling dependencies
 tabbycat = { version = "0.1", features = ["attributes"], optional = true }
 num-bigint = { workspace = true }
 
 [dev-dependencies]
+# Tests exercise the spill/mmap round trips regardless of feature state.
+tempfile = "3"
 assert_matches = "1.5"
 proptest = "1"
 serde_json = { workspace = true }
@@ -78,6 +80,20 @@ midnight-curves = { version = "0.3.0", features = [
 [features]
 default = ["committed-instances"]
 circuit-params = []
+
+# Host-only prover optimisations. Off by default so a wasm consumer neither
+# ships the dependencies nor can reach code paths that need a filesystem.
+#
+# Capability-shaped rather than one umbrella: the capabilities genuinely
+# differ. WASI has files but no mmap; browser wasm has neither. An umbrella
+# would force a target to take both or neither.
+
+# Map a file into the address space: the SRS companion reader/writer.
+mmap = ["dep:memmap2"]
+
+# Stream polynomials to a tempfile and map them back. Needs `mmap` to read
+# what it wrote, so it enables it rather than duplicating the capability.
+disk-spill = ["mmap", "dep:tempfile"]
 dev-curves = ["midnight-curves/dev-curves"]
 
 # This feature truncates challenges to half the size of the scalar field.
